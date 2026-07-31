@@ -1,0 +1,246 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(tidyr)
+library(phyloseq)
+library(FSA)
+library(ggplot2)
+library(ggpubr)
+library(rlang)
+library(rstudioapi)
+
+# ---- File paths ----
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/s18_microbial/otu_tables")
+output_path  <- file.path(current_path, "../output/alpha_diversity")
+
+# ---- Plot settings ----
+source(file.path(current_path, "plotting_aesthetics.R")) # Loads theme_wali()
+```
+
+
+## 1. Load & tidy phyloseq data
+```{r}
+# ---- Load normalized otu tables ----
+count_m <- data.matrix(
+  read.csv(file.path(
+    input_path,"s18_otu_rarefied_count_table.csv"), row.names = 1) # Count table
+  )
+tax_m <- as.matrix(
+  read.csv(file.path(
+    input_path,"s18_otu_rarefied_tax_table.csv"), row.names = 1) # Taxonomy table
+  )
+meta <- read.csv(file.path(
+  input_path,"s18_otu_rarefied_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Create phyloseq object ----
+ps_count_norm <- phyloseq(
+  otu_table(count_m, taxa_are_rows = T), 
+  tax_table(tax_m),
+  sample_data(meta))
+ps_count_norm
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+
+# ---- Format levels ----
+ps_count_norm@sam_data$DM     <- factor(ps_count_norm@sam_data$DM, levels = dm)
+ps_count_norm@sam_data$Stage  <- factor(ps_count_norm@sam_data$Stage, levels = stage)
+ps_count_norm@sam_data$Stage2 <- factor(ps_count_norm@sam_data$Stage2, levels = stage2)
+ps_count_norm@sam_data$Site   <- factor(ps_count_norm@sam_data$Site, levels = site)
+ps_count_norm@sam_data$Region <- factor(ps_count_norm@sam_data$Region, levels = region)
+```
+
+## 1. Calculate alpha diversity
+```{r}
+# ---- Standard alpha diversity (Observed, Chao1, Shannon, Simpson, InvSimpson) ----
+alpha <- estimate_richness(ps_count_norm, split = TRUE, measures = NULL)
+
+# ---- Rarefied count matrix (samples as rows) for Hill numbers ----
+otu_m <- as(otu_table(ps_count_norm), "matrix")
+if (taxa_are_rows(ps_count_norm)) otu_m <- t(otu_m)   # renyi() expects sites = rows
+
+# ---- Taxonomic Hill numbers: 0D, 1D, 2D (Chao, Chiu & Jost 2014) ----
+hill <- vegan::renyi(otu_m, scales = c(0, 1, 2), hill = TRUE)
+alpha$q0_D <- hill[["0"]]   # richness     (= Observed)
+alpha$q1_D <- hill[["1"]]   # exp(Shannon)
+alpha$q2_D <- hill[["2"]]   # inverse Simpson
+
+# ---- Pielou's evenness: J' = Shannon / log(richness) = log(1D) / log(0D) ----
+alpha$Pielou_J <- log(alpha$q1_D) / log(alpha$q0_D)
+
+# ---- Merge with sample data ----
+alpha_df <- cbind(
+  alpha, ps_count_norm@sam_data)
+alpha_df # Preview
+
+# ---- Save alpha diversity (all metrics) ----
+write.csv(data.frame(sample_data(alpha_df)), file.path(input_path,"../post_processing/s18_alpha_diversity.csv"))
+```
+
+
+## 2. Calculate stats
+```{r}
+# ---- Main function ----
+plot_alpha <- function(metric, title, y.position, y.lab = title) {
+
+  # Wrangle
+  df <- alpha_df %>%
+    dplyr::select(Desc_Sample_ID, DM, Value = !!sym(metric))
+
+  # Summary statistics
+  res <- df %>%
+    dplyr::group_by(DM) %>%
+    dplyr::summarize(stat = paste(round(mean(Value), 2), "±", round(sd(Value), 2))) %>%
+    pivot_wider(names_from = DM, values_from = stat)
+
+  # Kruskal-Wallis (omnibus)
+  kw <- kruskal.test(Value ~ DM, data = df)
+  kw_row <- res %>%
+    mutate(Metric = metric, H = round(kw$statistic, 1), p = round(kw$p.value, 4)) %>%
+    relocate(Metric)
+
+  # Dunn's post-hoc on the joint KW ranking, Benjamini-Hochberg corrected
+    dunn <- dunnTest(Value ~ DM, data = df, method = "bh")$res
+  lev  <- levels(df$DM)
+  pc <- dunn %>%
+    tidyr::separate(Comparison, into = c("group1", "group2"), sep = " - ") %>%
+    mutate(metric = title, p = round(P.adj, 4),
+           p.sign = symnum(P.adj, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                           symbols = c("***", "**", "*", ".", "ns"))) %>%
+    # stack by horizontal position: left-anchored lowest, rising to the right
+    arrange(pmin(match(group1, lev), match(group2, lev)),
+            pmax(match(group1, lev), match(group2, lev))) %>%
+    select(metric, group1, group2, p, p.sign)
+
+  # Highlight band for storm date
+  storm_x <- as.numeric(df$DM[df$DM == "23 Jul"][[1]])
+
+  # Plot
+  plot <- ggplot(df, aes(x = DM, y = Value)) +
+    geom_rect(xmin = storm_x - 0.5, xmax = storm_x + 0.5,
+              ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+    stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+    geom_boxplot(notch = FALSE, width = 0.5, lwd = 0.5) +
+    labs(x = "Date", y = y.lab) +
+    theme_wali()
+
+  sig <- pc[pc$p <= 0.05, ]
+  if (kw$p.value <= 0.05 && nrow(sig) > 0) {
+    plot <- plot + stat_pvalue_manual(
+      sig, step.increase = 0.1,
+      y.position = y.position, label = "p.sign", vjust = 0.65)
+  }
+
+  list(plot = plot, kw = as.data.frame(kw_row), dunn = pc)
+}
+
+# ---- Generate plots and collect stats ----
+metrics <- list(
+  # ---- Standard alpha diversity (Observed, Chao1, Shannon, Simpson, InvSimpson) ----
+  list(metric = "Observed",   title = "No. OTUs Observed",  y.position = 225),
+  list(metric = "Chao1",      title = "Chao1",               y.position = 225),
+  list(metric = "Shannon",    title = "Shannon Index",       y.position = 4.65),
+  list(metric = "Simpson",    title = "Simpson Index",       y.position = 1),
+  list(metric = "InvSimpson", title = "InvSimpson Index",    y.position = 52),
+  # ---- Hill numbers + Pielou's evenness ----
+  list(metric = "q0_D",     title = "0D Richness",     y.position = 225,
+       y.lab = expression(bold(""^0)*bolditalic(D))),
+  list(metric = "q1_D",     title = "1D exp(Shannon)", y.position = 97,
+       y.lab = expression(bold(""^1)*bolditalic(D))),
+  list(metric = "q2_D",     title = "2D InvSimpson",   y.position = 52,
+       y.lab = expression(bold(""^2)*bolditalic(D))),
+  list(metric = "Pielou_J", title = "Pielou's J'",     y.position = 0.88,
+       y.lab = expression(paste(bold("Pielou's "), bolditalic(J), bold("'"))))
+  ); results <- lapply(metrics, function(m) do.call(plot_alpha, m))
+```
+
+## 3. Save plots
+```{r}
+# ---- Extract plots ----
+(obs_plot  <- results[[1]]$plot)
+(chao_plot <- results[[2]]$plot)
+(shan_plot <- results[[3]]$plot)
+(simp_plot <- results[[4]]$plot)
+(invs_plot <- results[[5]]$plot)
+(q0_plot   <- results[[6]]$plot)   # 0D richness
+(q1_plot   <- results[[7]]$plot)   # 1D exp(Shannon)
+(q2_plot   <- results[[8]]$plot)   # 2D inverse Simpson
+(piel_plot <- results[[9]]$plot)   # Pielou's J'
+
+# ---- Export plots to file ----
+ggsave(file.path(output_path,"s18_alpha_observed.pdf"), obs_plot,  width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_chao1.pdf"),    chao_plot, width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_shannon.pdf"),  shan_plot, width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_simpson.pdf"),  simp_plot, width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_invsimp.pdf"),  invs_plot, width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_q0.pdf"),       q0_plot,   width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_q1.pdf"),       q1_plot,   width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_q2.pdf"),       q2_plot,   width = 3, height = 4)
+ggsave(file.path(output_path,"s18_alpha_pielou.pdf"),   piel_plot, width = 3, height = 4)
+
+# ---- Save ggplot objects ----
+saveRDS(q0_plot,   file.path(output_path, "../figure_6_s18_alpha_beta/components/A_q0_plot.rds"))
+saveRDS(q1_plot,   file.path(output_path, "../figure_6_s18_alpha_beta/components/A_q1_plot.rds"))
+saveRDS(q2_plot,   file.path(output_path, "../figure_6_s18_alpha_beta/components/A_q2_plot.rds"))
+
+ggarrange(
+  q0_plot,
+  q1_plot,
+  q2_plot,
+  ncol = 3,
+  labels = c("A","B","C")
+)
+```
+**Figure 4A-C.Alpha diversity expressed as Hill number:** where (A) ⁰D, OTU richness; (B) ¹D, the exponential of Shannon entropy; and (C) ²D, the inverse Simpson concentration. Grey shading marks the storm-period sampling date (23 July).Brackets denote significant pairwise differences in Dunn's post-hoc comparisons between dates (* p < 0.05, ** p < 0.01, *** p < 0.001).
+
+
+## 4. Save summary tables
+```{r}
+# ---- Extract summary tables ----
+(alpha_kw   <- bind_rows(lapply(results, `[[`, "kw")))
+(alpha_dunn <- bind_rows(lapply(results, `[[`, "dunn")))
+
+# ---- Export tables to file ----
+write.csv(alpha_kw,   file.path(output_path,"s18_alpha_test_kruskal.csv"),  row.names = FALSE)
+write.csv(alpha_dunn, file.path(output_path,"s18_alpha_test_dunnoxon.csv"), row.names = FALSE)
+
+# ---- Calculate percent change ----
+pct_change <- bind_rows(lapply(results, function(r) {
+  df <- alpha_df %>%
+    dplyr::select(DM, Value = !!sym(r$kw$Metric))
+  
+  pre   <- mean(df$Value[df$DM %in% c("09 Jul", "16 Jul")])
+  storm <- mean(df$Value[df$DM == "23 Jul"])
+  post  <- mean(df$Value[df$DM %in% c("30 Jul", "06 Aug")])
+  
+  data.frame(
+    Metric          = r$kw$Metric,
+    Pre_storm_mean  = round(pre, 3),
+    Storm_mean      = round(storm, 3),
+    Post_storm_mean = round(post, 3),
+    Pct_pre_to_storm  = round((storm - pre) / pre * 100, 1),
+    Pct_storm_to_post = round((post - storm) / storm * 100, 1)
+  )
+}))
+pct_change
+
+# ---- Export percent change ----
+write.csv(pct_change, file.path(output_path,"s18_alpha_pct_change.csv"), row.names = FALSE)
+```
+

@@ -1,0 +1,862 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(ggh4x)
+library(ggbeeswarm)
+library(rstatix)
+library(indicspecies)
+
+# ---- File paths ----
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/s18_microbial/otu_tables")
+output_path  <- file.path(current_path, "../output/disturbance_response")
+
+
+# ---- Plot settings ----
+source(file.path(current_path, "plotting_aesthetics.R")) # Loads theme_wali()
+```
+
+## 1. Load & tidy phyloseq data
+```{r}
+# ---- Load normalized otu tables ----
+abund_m <- data.matrix(
+  read.csv(file.path(input_path,"s18_otu_qc_relabund_table.csv"), row.names = 1) # Count table
+  )
+tax_m <- as.matrix(
+  read.csv(file.path(input_path,"s18_otu_qc_tax_table.csv"),   row.names = 1) # Taxonomy table
+  )
+meta <- read.csv(file.path(input_path,"s18_otu_qc_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Create phyloseq object ----
+ps_rel <- phyloseq(
+  otu_table(abund_m, taxa_are_rows = T), 
+  tax_table(tax_m),
+  sample_data(meta))
+ps_rel
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+pchem  <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts   <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+
+# ---- Format levels ----
+ps_rel@sam_data$DM     <- factor(ps_rel@sam_data$DM, levels = dm)
+ps_rel@sam_data$Stage  <- factor(ps_rel@sam_data$Stage, levels = stage)
+ps_rel@sam_data$Stage2 <- factor(ps_rel@sam_data$Stage2, levels = stage2)
+ps_rel@sam_data$Site   <- factor(ps_rel@sam_data$Site, levels = site)
+ps_rel@sam_data$Region <- factor(ps_rel@sam_data$Region, levels = region)
+```
+
+## Assign OTU fate classifications
+```{r}
+# ---- Shared constants ----
+date_levels <- c("09 Jul", "16 Jul", "23 Jul", "30 Jul", "06 Aug")
+fate_order  <- c("Persistent baseline", "Recovered", "Storm-displaced",        # cool / pre-existing
+                 "Storm-introduced", "Storm-transient", "Post-storm arrival")   # warm / novel
+fate_cols   <- c("Persistent baseline" = "grey50", "Recovered"          = "#2166AC",
+                 "Storm-displaced"     = "#9CC7E0", "Storm-introduced"   = "#B2182B",
+                 "Storm-transient"     = "#EF8A62", "Post-storm arrival" = "#FDDBC7")
+phase_map <- c(`09 Jul` = "pre",  `16 Jul` = "pre",
+               `23 Jul` = "storm",
+               `30 Jul` = "post", `06 Aug` = "post")
+
+# OTU table + per-sample phase
+otu <- as.data.frame(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) otu <- as.data.frame(t(otu))
+
+samp <- data.frame(sample_data(ps_rel))
+samp$Phase <- phase_map[as.character(samp$DM)]
+
+# Presence/absence per phase
+phases <- c("pre", "storm", "post")
+otu_presence <- sapply(phases, function(ph) {
+  in_phase <- rownames(samp)[samp$Phase == ph]
+  rowSums(otu[, in_phase, drop = FALSE] > 0) > 0
+})
+colnames(otu_presence) <- phases
+
+# ---- Classify fate ----
+pre <- otu_presence[, "pre"]; storm <- otu_presence[, "storm"]; post <- otu_presence[, "post"]
+fate <- case_when(
+   pre &  storm &  post ~ "Persistent baseline",
+   pre & !storm &  post ~ "Recovered",
+   pre & !post          ~ "Storm-displaced",      # pre-only and pre+storm both land here
+  !pre &  storm &  post ~ "Storm-introduced",
+  !pre &  storm & !post ~ "Storm-transient",
+  !pre & !storm &  post ~ "Post-storm arrival",
+  TRUE                  ~ "Other"
+)
+names(fate) <- rownames(otu)
+
+# Save fate
+write.csv(data.frame(OTU_ID = names(fate), Fate = unname(fate)),
+          file.path(output_path, "otu_fates.csv"),
+          row.names = FALSE)
+
+# Diagnostics
+cat("OTU fate classification:\n"); print(table(fate))
+cat("\nSummed mean relative abundance by fate (%):\n")
+print(round(sort(tapply(rowMeans(otu), fate, sum), decreasing = TRUE) * 100, 2))
+
+# Long table: OTU × sample, with fate and date
+otu_long <- otu %>%
+  rownames_to_column("OTU") %>%
+  mutate(Fate = fate[OTU]) %>%
+  pivot_longer(-c(OTU, Fate), names_to = "Sample", values_to = "RelAbund") %>%
+  left_join(rownames_to_column(samp, "Sample") %>% select(Sample, DM), by = "Sample") %>%
+  mutate(DM = factor(DM, levels = date_levels))
+
+# Abundance share by fate × date
+fate_by_date <- otu_long %>%
+  group_by(DM, Fate) %>%
+  summarise(TotalAbund = sum(RelAbund), .groups = "drop_last") %>%
+  mutate(PropAbund = TotalAbund / sum(TotalAbund) * 100) %>%
+  ungroup()
+
+# ---- Summary table ----
+fate_totals <- as.data.frame(table(fate), responseName = "Total_OTUs") %>% rename(Fate = fate)
+
+otu_counts <- otu_long %>%
+  filter(RelAbund > 0) %>%
+  group_by(DM, Fate) %>%
+  summarise(n_OTUs = n_distinct(OTU), .groups = "drop")
+
+fate_table <- fate_by_date %>%
+  left_join(otu_counts, by = c("DM", "Fate")) %>%
+  mutate(n_OTUs = replace_na(n_OTUs, 0),
+         Cell = if_else(n_OTUs == 0, "—", paste0(round(PropAbund, 1), "% (", n_OTUs, ")"))) %>%
+  select(DM, Fate, Cell) %>%
+  pivot_wider(names_from = DM, values_from = Cell) %>%
+  left_join(fate_totals, by = "Fate") %>%
+  relocate(Fate, Total_OTUs) %>%
+  arrange(factor(Fate, levels = fate_order))
+
+totals_row <- otu_counts %>%
+  group_by(DM) %>%
+  summarise(Total = sum(n_OTUs), .groups = "drop") %>%
+  transmute(DM, Cell = as.character(Total)) %>%
+  pivot_wider(names_from = DM, values_from = Cell) %>%
+  mutate(Fate = "Total detected OTUs", Total_OTUs = sum(fate_totals$Total_OTUs)) %>%
+  relocate(Fate, Total_OTUs)
+
+(fate_table <- bind_rows(fate_table, totals_row))
+write.csv(fate_table, file.path(output_path, "s18_otu_fates_summary.csv"), row.names = FALSE)
+
+# ---- Stacked bar: fate composition by date ----
+(p_fate_bar <- ggplot(fate_by_date %>% mutate(Fate = factor(Fate, levels = rev(fate_order))),
+                      aes(x = DM, y = PropAbund, fill = Fate)) +
+   annotate("rect", xmin = 2.5, xmax = 3.5, ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +  # storm
+   geom_col(position = "stack", colour = "white", linewidth = 0.3, width = 0.75) +
+   scale_fill_manual(values = fate_cols, name = "OTU fate") +
+   scale_y_continuous(expand = c(0, 0), breaks = seq(0, 100, 25)) +
+   coord_cartesian(ylim = c(0, 100)) +
+   labs(x = "Date", y = "Relative abundance (%)") +
+   theme_wali())
+
+# Save plot
+saveRDS(p_fate_bar, file.path(output_path, "../figure_7_s18_taxa_response/components/A_otu_fates_bar.rds"))
+
+# ---- Fate dot plot (coloured by fate) ----
+# Dot data
+dot_data <- ps_rel %>%
+  filter_taxa(function(x) mean(x) >= 0.0001, TRUE) %>%      # mean RA ≥ 0.01%
+  psmelt() %>%
+  group_by(OTU, DM) %>%
+  summarise(Abundance = mean(Abundance), .groups = "drop") %>%
+  group_by(OTU) %>%
+  mutate(abund_col = na_if(Abundance[DM == "09 Jul"][1], 0)) %>%   # 09 Jul baseline; 0 → NA
+  ungroup() %>%
+  filter(Abundance > 0) %>%
+  mutate(Fate = factor(fate[OTU], levels = fate_order),
+         DM   = factor(DM, levels = date_levels))
+
+
+(p_fate_dot <- ggplot(dot_data %>%
+                        mutate(grp = if_else(Fate == "Persistent baseline", "base", "other")) %>%
+                        arrange(Fate),                       # Persistent first → drawn behind
+                      aes(x = DM, y = Abundance, fill = Fate,
+                          alpha = grp, size = grp, colour = grp)) +
+   annotate("rect", xmin = 2.5, xmax = 3.5, ymin = 0, ymax = Inf, fill = "#dfdfdf") +
+   geom_point(shape = 21, stroke = 0.4, position = position_quasirandom(width = 0.4, varwidth = T)) +
+   scale_fill_manual(values = fate_cols, name = "OTU fate", limits = fate_order) +
+   scale_alpha_manual(values = c(base = 0.35, other = 1), guide = "none") +
+   scale_size_manual( values = c(base = 1.5,  other = 1.9),  guide = "none") +
+   scale_colour_manual(values = c(base = "grey35", other = "black"), guide = "none") +
+   guides(fill = guide_legend(override.aes = list(alpha = 1, size = 3, colour = "black"))) +
+   scale_y_continuous(trans = "log10", labels = scales::percent) +
+   labs(x = "Date", y = "OTU mean relative abundance") +
+   theme_wali())
+
+# Save plot
+saveRDS(p_fate_dot, file.path(output_path, "../figure_7_s18_taxa_response/components/B_otu_fates_dot.rds"))
+
+# ---- Archived: rainbow/grey dot plot (coloured by 09 Jul baseline) ----
+(p_fate_dot_grey <- ggplot(arrange(dot_data, OTU, DM),
+                           aes(x = DM, y = Abundance, colour = log(abund_col))) +
+   geom_line(aes(group = OTU), linewidth = 0.6, alpha = 0.5,
+             position = position_jitter(width = 0.2, height = 0, seed = 3922)) +
+   geom_point(aes(fill = log(abund_col)), shape = 21, size = 2, colour = "black",
+              position = position_jitter(width = 0.2, height = 0, seed = 3922)) +
+   scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+                          na.value = "grey70", name = "Log(09 Jul abundance)") +
+   scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+                        na.value = "grey50", name = "Log(09 Jul abundance)") +
+   scale_y_continuous(trans = "log10", labels = scales::percent) +
+   labs(x = "Date", y = "OTU mean relative abundance") +
+   theme_wali())
+
+ggsave(file.path(output_path, "../figure_6_s18_alpha_beta/previous_versions/s18_grey_dots.pdf"),
+       p_fate_dot_grey, device = "pdf", width = 9, height = 6, units = "in", dpi = 1000)
+
+# Per-OTU per-date mean (%) and pre-storm baseline
+otu_traj <- otu_long %>%
+  group_by(OTU, Fate, DM) %>%
+  summarise(MeanRel = mean(RelAbund) * 100, .groups = "drop")
+
+baseline_abund <- otu_long %>%
+  filter(DM %in% c("09 Jul", "16 Jul")) %>%
+  group_by(OTU) %>%
+  summarise(Baseline = mean(RelAbund) * 100, .groups = "drop")
+
+# Floor zeros for the log axis; order factors
+floor_val <- min(otu_traj$MeanRel[otu_traj$MeanRel > 0]) / 2
+otu_traj <- otu_traj %>%
+  left_join(baseline_abund, by = "OTU") %>%
+  mutate(MeanRel_plot  = if_else(MeanRel  == 0, floor_val, MeanRel),
+         Baseline_plot = if_else(Baseline == 0, floor_val, Baseline),
+         Fate = factor(Fate, levels = fate_order),
+         DM   = factor(DM,   levels = date_levels)) %>%
+  filter(!is.na(Fate))            # guard against any "Other"
+
+# Median trajectory per fate
+fate_median <- otu_traj %>%
+  group_by(Fate, DM) %>%
+  summarise(Median = median(MeanRel_plot), .groups = "drop")
+
+# Plot
+(p_fate_traj <- ggplot(otu_traj,
+                       aes(x = DM, y = MeanRel_plot, group = OTU, colour = Baseline_plot)) +
+   annotate("rect", xmin = 2.5, xmax = 3.5, ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+   geom_line(alpha = 0.20, linewidth = 0.25, color = "grey50") +
+   geom_line(data = fate_median, aes(x = DM, y = Median, group = 1),
+             inherit.aes = FALSE, colour = "black", linewidth = 0.8) +
+   facet_wrap(~ Fate, nrow = 2, ncol = 3) +
+   scale_y_log10(labels = scales::label_number()) +
+   labs(x = "Date", y = "Relative abundance (%)") +
+   theme_wali())
+
+saveRDS(p_fate_traj, file.path(output_path, "../figure_supp6_18S_mechanisms/components/C_otu_trajectories.rds"))
+```
+**Figure 4C. Relative abundance composition by storm-response fate across the five sampling dates.** Stacked bars give the percentage of total bacterioplankton relative abundance contributed by each OTU fate category (defined in Table 2) on each date. Persistent baseline OTUs (grey) constitute the bulk of the assemblage throughout, while the storm-responsive fates (colored) form minor shares. Gray shading marks the storm day (23 Jul).
+
+**Figure 4D. OTU-level relative abundance by storm-response fate across the five sampling dates.** Each point represents one OTU — restricted to those with mean relative abundance ≥ 0.01% across the assemblage — on a single date, plotted as its mean relative abundance across sampling sites and colored by fate category (defined in Table S#). Persistent baseline OTUs are shown in grey as a backdrop, with the storm-responsive fates colored; points are horizontally jittered within each date to reduce overplotting. Zero values are plotted at a below-detection floor (half the smallest non-zero value) to permit display on the log~10~-transformed y-axis. Gray shading marks the storm day (23 Jul).
+
+**Figure [archived — grey dots]. OTU-level relative abundance trajectories colored by pre-storm baseline abundance.** Each line traces one OTU (mean relative abundance ≥ 0.01% across the assemblage) across the five sampling dates, plotted as its mean relative abundance across sampling sites and colored by the logarithm of its 09 Jul relative abundance (reversed Spectral palette; red = high baseline, blue = low), with OTUs undetected on 09 Jul shown in grey. Points and connecting lines are horizontally jittered to reduce overplotting. The y-axis is log~10~-transformed.
+
+**Figure S5C. OTU-level relative abundance trajectories across storm-response fates:** pre-existing fates (Persistent baseline, Recovered, Storm-displaced; top row, blue facet labels) and novel fates (Storm-introduced, Storm-transient, Post-storm arrival; bottom row, red facet labels). Each thin line represents one OTU, plotted on each date as its mean relative abundance across sampling sites; line intensity encodes pre-storm baseline relative abundance (darker = higher baseline), with novel-fate OTUs — absent pre-storm by definition — shown at the lightest intensity. The bold line in each facet traces the median OTU trajectory. Zero values, including absences intrinsic to a fate category, are plotted at a below-detection floor (half the smallest non-zero value) to permit display on the log~10~-transformed y-axis. Gray shading marks the storm day (23 Jul) throughout.
+
+
+
+## Abundance-based resilience 
+Investigates how abundances of shared taxa changed (increased, decreased, recovered) with Wilcoxon signed-rank tests.
+```{r}
+# Write function to calculate percent change
+calc_perc_change <- function(pre, comp) { # For pre-storm (pre) and comparison (comp) values
+  pre_mean <- mean(pre)
+  comp_mean <- mean(comp)
+  if (all(pre == 0 & comp == 0, na.rm = TRUE)) { return(0) } # If both vectors are only zeros, return 0
+  out <- ((comp_mean - pre_mean)/pre_mean)*100
+  return(round(out, 1))
+  # Notes:  If the OTU was absent before the storm but present in the comparison, the results will be +Inf (OTU appeared)
+  #         If the OTU was present pre-storm but absent in the comparison, the result will be -Inf (OTU dissappeared)
+}
+
+# Write function to calculate number of complete comparisons
+calc_n <- function(pre, comp) { # For pre-storm (pre) and comparison (comp) values
+   idx <- complete.cases(pre, comp) # Identify complete pairs
+   pre  <- pre[idx] # Keep only complete pairs
+   comp <- comp[idx] # Keep only complete pairs
+   stopifnot(length(pre)==length(comp)) # Sanity check
+   return(length(comp)) # Return number of comparisons
+}
+
+# Write function to run test
+calc_wilcox <- function(pre, comp) { # For pre-storm (pre) and comparison (comp) values
+    idx <- complete.cases(pre, comp) # Identify complete pairs
+    pre  <- pre[idx] # Keep only complete pairs
+    comp <- comp[idx] # Keep only complete pairs
+    if (all(pre == comp, na.rm = TRUE)) { return(1) } # If both vectors are identical, there was no change so return p = 1
+    wilc <- wilcox.test(pre, comp, paired = TRUE, exact = FALSE) # Run Wilcox test
+    return(wilc$p.value) # Return test statistics
+}
+
+# Write function to calculate effect size
+calc_effsize <- function(pre, comp) { # For orginal (pre) and comparison (comp) values
+  idx <- complete.cases(pre, comp) # Identify complete pairs
+  pre  <- pre[idx] # Keep only complete pairs
+  comp <- comp[idx] # Keep only complete pairs
+  if (all(pre == comp, na.rm = TRUE)) { return(0) } # If both vectors are identical, there was no change so return r = 0
+  df_long <- data.frame(value = c(pre, comp), group = factor(rep(c("pre", "comp"), each = length(pre)), levels = c("pre", "comp"))) # Wrangle into dataframe
+  out <- wilcox_effsize(df_long, value ~ group, paired = TRUE)
+  return(out$effsize[[1]]) # Return effect statistics
+}
+
+# Write function to run tests for all otus 
+run_wilcox = function(ps) {
+  # 1. Filter taxa -----------------------------
+  ps_wilcox <- filter_taxa(ps, function(x) max(x, na.rm = TRUE) > 0.01, prune = TRUE) # Abundance filter: Remove taxa with < 1% maximum abundance
+  ps_wilcox = filter_taxa(ps_wilcox, function(x) sum(x > 0) >= 5, TRUE) # Prevalence filter: Remove taxa present in < 5 samples (10% of samples)
+
+  # 2. Data wrangling ---------------------------
+  tax <- as.data.frame(tax_table(ps_wilcox))
+  tax$OTU <- rownames(tax)
+  tax_table(ps_wilcox) <- tax_table(as.matrix(tax))
+  df = merge(as.data.frame(otu_table(t(ps_wilcox))), as.data.frame(sample_data(t(ps_wilcox))), by = 0) # Save as data frame
+  
+  # 3. Compute site means per Taxon x Site x Stage2 ------------------
+  site_means <- df %>%
+    group_by(Site, Stage2) %>%
+    dplyr::summarise_at(vars(starts_with("Otu")), mean, na.rm = TRUE) %>%
+    pivot_wider(names_from = Stage2, values_from = starts_with("Otu"))
+  
+  # 4. Run Wilcoxon Signed Rank Tests ------------------
+  otus <- gsub("_Pre$", "", grep("_Pre$", names(site_means), value = TRUE)) # Save vector of OTU names
+  res <- data.frame(OTU = otus, # Create empty dataframe to fill
+                    perc_diff_pre_v_storm = NA, perc_diff_pre_v_post1w = NA, perc_diff_pre_v_post2w = NA, # d = % difference
+                    n_pre_v_storm = NA, n_pre_v_post1w = NA, n_pre_v_post2w = NA, # n = number of comparisons
+                    wilcox_p_pre_v_storm = NA, wilcox_p_pre_v_post1w = NA, wilcox_p_pre_v_post2w = NA, # p = p-value
+                    wilcox_r_pre_v_storm = NA, wilcox_r_pre_v_post1w = NA, wilcox_r_pre_v_post2w = NA) # r = effect size
+                     
+  for (i in 1:length(otus)) { # For each OTU
+    # Subset data
+    pre    <- site_means[[paste0(otus[i], "_Pre")]]    # Save vector of pre-storm data
+    storm  <- site_means[[paste0(otus[i], "_Storm")]]  # Save vector of storm data
+    post1w <- site_means[[paste0(otus[i], "_Post1w")]] # Save vector of post-storm week 1 data
+    post2w <- site_means[[paste0(otus[i], "_Post2w")]] # Save vector of post-storm week 2 data
+    
+    # Calculate percent difference
+    res$perc_diff_pre_v_storm[i]   <- calc_perc_change(pre = pre, comp = storm) # Save percent differences (d)
+    res$perc_diff_pre_v_post1w[i]  <- calc_perc_change(pre = pre, comp = post1w)
+    res$perc_diff_pre_v_post2w[i]  <- calc_perc_change(pre = pre, comp = post2w)
+    
+    # Save number of comparisons
+    res$n_pre_v_storm[i]           <- calc_n(pre = pre, comp = storm) # Ensure exact matching and save number of comparisons (n)
+    res$n_pre_v_post1w[i]          <- calc_n(pre = pre, comp = post1w)
+    res$n_pre_v_post2w[i]          <- calc_n(pre = pre, comp = post2w)
+    
+    # Calculate paired Wilcoxon Signed-Rank Tests
+    res$wilcox_p_pre_v_storm[i]    <- calc_wilcox(pre = pre, comp = storm) # Save p-values (p)
+    res$wilcox_p_pre_v_post1w[i]   <- calc_wilcox(pre = pre, comp = post1w)
+    res$wilcox_p_pre_v_post2w[i]   <- calc_wilcox(pre = pre, comp = post2w)
+    
+    # Calculate paired Wilcoxon effect sizes
+    res$wilcox_r_pre_v_storm[i]    <- calc_effsize(pre = pre, comp = storm) # Save effect sizes (r)
+    res$wilcox_r_pre_v_post1w[i]   <- calc_effsize(pre = pre, comp = post1w)
+    res$wilcox_r_pre_v_post2w[i]   <- calc_effsize(pre = pre, comp = post2w)
+  }
+  
+  # 5. P-value adjustment and status categorization  ------------------
+  res2 <- res %>% # P-value adjustment and categorization
+    mutate(
+      wilcox_p_pre_v_storm = round(p.adjust(wilcox_p_pre_v_storm, method = "BH"), 4), # P-value adjustment (Benjamini-Hochberg method)
+      wilcox_p_pre_v_post1w  = round(p.adjust(wilcox_p_pre_v_post1w,  method = "BH"), 4),
+      wilcox_p_pre_v_post2w  = round(p.adjust(wilcox_p_pre_v_post2w,  method = "BH"), 4),
+      wilcox_s_pre_v_storm = symnum(wilcox_p_pre_v_storm, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", "**", "*", ".","ns")), # Add sign
+      wilcox_s_pre_v_post1w = symnum(wilcox_p_pre_v_post1w, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", "**", "*", ".","ns")),
+      wilcox_s_pre_v_post2w = symnum(wilcox_p_pre_v_post2w, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", "**", "*", ".","ns")),
+      status_storm = ifelse(wilcox_p_pre_v_storm <= 0.05, "altered", "recovered"), # Categorize as altered or recovered
+      status_post1w  = ifelse(wilcox_p_pre_v_post1w  <= 0.05, "altered", "recovered"),
+      status_post2w  = ifelse(wilcox_p_pre_v_post2w  <= 0.05, "altered", "recovered")
+    )
+  
+  # 6. Summarize results  ------------------
+  tot = sum(taxa_sums(prune_taxa(res2$OTU, ps)))/sum(taxa_sums(ps))*100 # Save sum of tested otu's total relative abundance
+  
+  summ_res <- res2 %>%
+    dplyr::summarise(
+      total = dplyr::n(),
+      altered = sum(status_storm == "altered", na.rm = TRUE),
+      recovered_post1w = sum(status_storm == "altered" & status_post1w == "recovered", na.rm = TRUE),
+      recovered_post2w = sum(status_storm == "altered" & status_post2w == "recovered", na.rm = TRUE)
+    ) %>%
+    dplyr::mutate(
+      perc_altered = 100 * altered / total,
+      perc_recovered_post1w = 100 * recovered_post1w / altered,
+      perc_recovered_post2w = 100 * recovered_post2w / altered
+    )
+  
+  # 6. Return results   ------------------
+  out = list(res = res2, 
+             tot = paste("The total relative abundnace of tested groups is ", round(tot,2), "%.", sep = ""), # Sum of tested otu's total relative abundance
+             summ = summ_res)
+  return(out)
+}
+
+# wilcox_OTU <- run_wilcox(ps = ps_rel) # Run tests at the OTU level
+ps_rel_genus = tax_glom(ps_rel, taxrank="Genus")
+wilcox_genera <- run_wilcox(ps = ps_rel_genus) # Run tests at the genus level
+wilcox_genera$tot
+wilcox_genera$summ
+
+# Save wilcoxon summary table
+(wilcox_df <- wilcox_genera$res[ ,c(
+    # Pre v. storm
+    "perc_diff_pre_v_storm",  # Percent difference
+    "wilcox_r_pre_v_storm",   # Wilcoxon effect size
+    "wilcox_p_pre_v_storm",   # Wilcoxon p-value
+    "wilcox_s_pre_v_storm",   # Wilcoxon p-sign
+    #  Pre v. post1w
+    "perc_diff_pre_v_post1w", # Percent difference
+    "wilcox_r_pre_v_post1w",  # Wilcoxon effect size
+    "wilcox_p_pre_v_post1w",  # Wilcoxon p-value
+    "wilcox_s_pre_v_post1w",  # Wilcoxon p-sign
+    # Pre v. post2w
+    "perc_diff_pre_v_post2w", # Percent difference
+    "wilcox_r_pre_v_post2w",  # Wilcoxon effect size
+    "wilcox_p_pre_v_post2w",  # Wilcoxon p-value
+    "wilcox_s_pre_v_post2w"   # Wilcoxon p-sign
+  )
+])
+
+
+```
+**Methods:** Paired Wilcoxon signed-rank tests were used to assess changes in taxon-specific relative abundances across sampling periods. To evaluate disturbance responses and subsequent recovery relative to baseline conditions, each period was compared directly to the pre-storm period only. This design captures which taxa exhibited significant increases or decreases during the storm and whether their abundances returned toward baseline over time. Only taxa present in both samples within a comparison were included, and p-values were adjusted using the Benjamini–Hochberg procedure.
+
+**Results:** 
+
+
+## Membership-based resilience
+Investigates taxa gains and losses, turnover/replacement, and nestedness.
+```{r}
+# 2. Tabulate OTU by stage across genera -----------------------------
+ps_pa <- transform_sample_counts(ps_rel, function(x) { 
+  x[x > 0] <- 1 # Transform relative abundace to presence/absence
+  return(x)
+})
+
+otu_tax <- tax_table(ps_pa) %>%
+  data.frame() %>%
+  rownames_to_column("Otu") %>%
+  select(Otu, Division, Class, Family, Genus) 
+
+otu_meta <- sample_data(ps_pa) %>%
+  data.frame() %>% rownames_to_column("SampleID")
+
+otu_counts <- t(otu_table(ps_pa)) %>%
+  data.frame() %>%
+  rownames_to_column("SampleID") %>% 
+  left_join(otu_meta[,c("SampleID", "Stage2")], by = "SampleID") %>%
+  pivot_longer(
+    cols = starts_with("Otu"),    # OTU abundance columns
+    names_to = "Otu",
+    values_to = "Abundance"
+  ) %>%
+  mutate(Abundance = as.numeric(Abundance))
+
+
+otu_summ <- otu_counts %>%
+  left_join(otu_tax, by = "Otu") %>%
+  dplyr::group_by(Stage2, Division, Class, Family, Genus) %>%
+  dplyr::summarize(observed = sum(Abundance)) %>%
+  ungroup() %>%                     # drop grouping
+  pivot_wider(
+    names_from  = Stage2,           # columns = stages
+    values_from = observed,         # fill with observed counts
+    values_fill = 0,                # 0 if never observed in that stage
+    names_glue  = "no_otus_{Stage2}"
+  ) %>%
+  mutate(
+    no_otus_total = rowSums(across(starts_with("no_otus_"))))
+```
+
+
+## Membership turnover
+Captures presence/absence-based gain/loss between dates; can partition into “replacement” vs “nestedness” (Baselga 2010)
+Ignores abundance weighting (so minor OTUs count equally)
+How many OTUs disappeared and how many new ones appeared after the storm?
+```{r}
+# Convert to presence/absence matrix
+ps_pa <- filter_taxa(ps_rel, function(x) max(x, na.rm = TRUE) > 1e-4, prune = TRUE)  # >0.01%
+
+# Prevalence filter
+ps_pa <- filter_taxa(ps_pa, function(x) sum(x > 0) >= 3, TRUE) # Remove OTUs not present in at least 3 samples
+  
+ps_pa <- transform_sample_counts(ps_pa, function(x) ifelse(x > 0, 1, 0))
+otu_pa <- as.data.frame(t(otu_table(ps_pa)))
+
+# Calculate pairwise beta diversity (Jaccard)
+beta_pair <- betapart::beta.pair(otu_pa, index.family = "jaccard")
+
+# Components:
+# beta_pair$beta.jtu = turnover component (species replacement)
+# beta_pair$beta.jne = nestedness component (gain/loss asymmetry)
+# beta_pair$beta.jac = total Jaccard dissimilarity
+
+# Make presence/absence by Date_group
+df <- data.frame(sample_data(ps_pa))
+
+grouped_pa <- otu_pa %>%
+  tibble::rownames_to_column("SampleID") %>%    # make sample names a column
+  left_join(
+    sample_data(ps_pa) %>%
+      data.frame() %>%
+      tibble::rownames_to_column("SampleID"),   # same here for metadata
+    by = "SampleID"
+  ) %>%
+  dplyr::group_by(Stage2) %>%
+  dplyr::summarise(across(where(is.numeric), ~ as.numeric(any(. > 0))))
+
+# Now each Date_group (Pre, Storm, etc.) is one row
+grouped_pa_mat <- as.data.frame(grouped_pa[,-1])
+rownames(grouped_pa_mat) <- grouped_pa$Stage2
+
+# Compute pairwise dissimilarities between timepoints
+beta_groups <- betapart::beta.pair(t(grouped_pa_mat), index.family = "jaccard")
+
+# Example: compute pairwise dissimilarity between Pre vs each timepoint
+pre_ids    <- rownames(df[df$Stage2 == "Pre", ])
+storm_ids  <- rownames(df[df$Stage2 == "Storm", ])
+post1_ids  <- rownames(df[df$Stage2 == "Post1w", ])
+post2_ids  <- rownames(df[df$Stage2 == "Post2w", ])
+
+(res <- data.frame(
+  Comparison = c("Pre-Storm", "Pre-Post_1wk", "Pre-Post_2wk"),
+  # Total Jaccard dissimilarity (overall compositional difference)
+  Beta_total = c(
+    mean(as.matrix(beta_pair$beta.jac)[pre_ids, storm_ids]),
+    mean(as.matrix(beta_pair$beta.jac)[pre_ids, post1_ids]),
+    mean(as.matrix(beta_pair$beta.jac)[pre_ids, post2_ids])
+  ),
+  # Turnover component (taxa replaced)
+  Beta_jtu = c(
+    mean(as.matrix(beta_pair$beta.jtu)[pre_ids, storm_ids]),
+    mean(as.matrix(beta_pair$beta.jtu)[pre_ids, post1_ids]),
+    mean(as.matrix(beta_pair$beta.jtu)[pre_ids, post2_ids])
+  ),
+  # Nestedness component (taxa lost/gained without replacement)
+  Beta_jne = c(
+    mean(as.matrix(beta_pair$beta.jne)[pre_ids, storm_ids]),
+    mean(as.matrix(beta_pair$beta.jne)[pre_ids, post1_ids]),
+    mean(as.matrix(beta_pair$beta.jne)[pre_ids, post2_ids])
+  )
+))
+
+# Save total Jaccard dissimilarity
+jac_df = rbind(
+  data.frame(Group = "Pre-Storm", Value = as.vector(as.matrix(beta_pair$beta.jac)[pre_ids, storm_ids])),
+  data.frame(Group = "Pre-Post_1wk", Value = as.vector(as.matrix(beta_pair$beta.jac)[pre_ids, post1_ids])),
+  data.frame(Group = "Pre-Post_2wk", Value = as.vector(as.matrix(beta_pair$beta.jac)[pre_ids, post2_ids])))
+jac_df$Group = factor(jac_df$Group, levels = c("Pre-Storm", "Pre-Post_1wk", "Pre-Post_2wk"))
+
+# Save turnover component (taxa replaced)
+jtu_df <- rbind(
+  data.frame(Group = "Pre-Storm", Value = as.vector(as.matrix(beta_pair$beta.jtu)[pre_ids, storm_ids])),
+  data.frame(Group = "Pre-Post_1wk", Value = as.vector(as.matrix(beta_pair$beta.jtu)[pre_ids, post1_ids])),
+  data.frame(Group = "Pre-Post_2wk", Value = as.vector(as.matrix(beta_pair$beta.jtu)[pre_ids, post2_ids])))
+jtu_df$Group = factor(jtu_df$Group, levels = c("Pre-Storm", "Pre-Post_1wk", "Pre-Post_2wk"))
+
+# Save nestedness component (taxa lost/gained without replacement)
+jne_df <- rbind(
+  data.frame(Group = "Pre-Storm", Value = as.vector(as.matrix(beta_pair$beta.jne)[pre_ids, storm_ids])),
+  data.frame(Group = "Pre-Post_1wk", Value = as.vector(as.matrix(beta_pair$beta.jne)[pre_ids, post1_ids])),
+  data.frame(Group = "Pre-Post_2wk", Value = as.vector(as.matrix(beta_pair$beta.jne)[pre_ids, post2_ids])))
+jne_df$Group = factor(jne_df$Group, levels = c("Pre-Storm", "Pre-Post_1wk", "Pre-Post_2wk"))
+
+# ---- Kruskal-Wallis ----
+Values <- c("Total Jaccard","Turnover","Nestedness")
+kw_jac <- jac_df %>% kruskal_test(Value ~ Group)
+kw_jtu <- jtu_df %>% kruskal_test(Value ~ Group)
+kw_jne <- jne_df %>% kruskal_test(Value ~ Group)
+(jac_kw_tab <- cbind(Values, rbind(kw_jac, kw_jtu, kw_jne)))
+
+# ---- Dunn post-hoc with BH adjustment, plus bracket positions ----
+dunn_jac <- jac_df %>%
+  dunn_test(Value ~ Group, p.adjust.method = "BH") %>%
+  add_xy_position(x = "Group", step.increase = 0.10)
+dunn_jtu <- jtu_df %>%
+  dunn_test(Value ~ Group, p.adjust.method = "BH") %>%
+  add_xy_position(x = "Group", step.increase = 0.10)
+dunn_jne <- jne_df %>%
+  dunn_test(Value ~ Group, p.adjust.method = "BH") %>%
+  add_xy_position(x = "Group", step.increase = 0.10)
+
+# Function to plot
+plot_jac <- function(df, dunn, title, y_pos) {
+  ggplot(df, aes(x = Group, y = Value)) +
+    geom_rect(xmin = 1 - 0.5, xmax = 1 + 0.5,
+              ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+    stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+    geom_boxplot(notch = FALSE, width = 0.5, lwd = 0.5) +
+    stat_pvalue_manual(dunn, label = "p.adj.signif",
+                       y.position = y_pos,                # <- pass as vector
+                       tip.length = 0.025, hide.ns = TRUE,
+                       bracket.size = 0.4) +
+    scale_y_continuous(limits = c(0, 1.2),
+                       breaks = seq(0, 1, 0.25)) +
+    labs(x = "Comparison", y = title) +
+    scale_x_discrete(labels = c("Pre-Storm" = "Pre–23 Jul",
+                                "Pre-Post_1wk" = "Pre–30 Jul",
+                                "Pre-Post_2wk" = "Pre–06 Aug")) +
+    theme_wali()
+}
+
+# Plot
+(jac_plot <- ggarrange(
+  plot_jac(jac_df, dunn_jac,
+           expression(paste("Jaccard Dissimilarity (", italic(beta)[jac], ")")),
+           y_pos = c(1, 1.08)) +
+    theme(axis.title.x = element_blank()),
+  plot_jac(jtu_df, dunn_jtu,
+           expression(paste("Turnover (", italic(beta)[jtu], ")")),
+           y_pos = c(1, 1.08, 1.16)),
+  plot_jac(jne_df, dunn_jne,
+           expression(paste("Nestedness (", italic(beta)[jne], ")")),
+           y_pos = c(0.7, 0.78)) +
+    theme(axis.title.x = element_blank()),
+  ncol = 3, nrow = 1, align = "hv"
+))
+
+# ---- Save ggplot objects ----
+saveRDS(jac_plot, file.path(output_path, "../figure_supp6_18S_mechanisms/components/B_jaccard_dissim.rds"))
+```
+**Figure S5B. Pre-storm-to-storm and pre-storm-to-post-storm β-diversity of the bacterioplankton community, partitioned into turnover and nestedness, at Heʻeia Fishpond, July–August 2014.** Pairwise Jaccard dissimilarity between each pre-storm sample (09, 16 Jul) and each sample collected on the storm day (Pre–23 Jul; Tropical Storm Wali) or a post-storm date (Pre–30 Jul, Pre–06 Aug), partitioned following Baselga's framework into total Jaccard dissimilarity (β~jac~; left), its turnover component (β~jtu~; center), and its nestedness-resultant component (β~jne~; right). Boxplots show median, interquartile range, and 1.5×IQR whiskers, with points beyond the whiskers shown individually (n = [confirm] pairwise comparisons per group). Gray shading marks the storm-day comparison (Pre–23 Jul). Brackets denote differences between comparison groups (pairwise Wilcoxon rank-sum tests, Benjamini–Hochberg adjusted): * p ≤ 0.05, ** p ≤ 0.01, *** p ≤ 0.001, **** p ≤ 0.0001; non-significant comparisons not shown.
+
+
+## Tabulate introduced OTUs
+```{r}
+# 1. Summarize OTUs by stage -----------------------------
+# Subset by date group
+pre_dates  <- c("09 Jul", "16 Jul")
+storm_date <- c("23 Jul")
+post1_date <- c("30 Jul")
+post2_date <- c("06 Aug")
+ps_pre   <- subset_samples(ps_rel,  sample_data(ps_rel)[["DM"]] %in% pre_dates)
+ps_storm <- subset_samples(ps_rel,  sample_data(ps_rel)[["DM"]] %in% storm_date)
+ps_p1    <- subset_samples(ps_rel,  sample_data(ps_rel)[["DM"]] %in% post1_date)
+ps_p2    <- subset_samples(ps_rel,  sample_data(ps_rel)[["DM"]] %in% post2_date)
+
+# Extract names of OTUs detected above threshold in each date group
+thresh = 0 # detection threshold (0 = any presence; use >=1 for counts)
+pre_set   <- names(which(taxa_sums(ps_pre)   > thresh))
+storm_set <- names(which(taxa_sums(ps_storm) > thresh))
+p1_set    <- names(which(taxa_sums(ps_p1)    > thresh))
+p2_set    <- names(which(taxa_sums(ps_p2)    > thresh))
+  
+# Calculate the number of OTUs introduced during Storm Wali (i.e., not previously present)
+alloch   <- setdiff(storm_set, pre_set) # "allochthonous" = present in storm but absent pre-storm
+n_alloch <- length(alloch)
+
+# Persistence
+n_alloch_p1    <- sum(alloch %in% p1_set) # Calculate the number of storm-introduced OTUs still present one week later
+n_alloch_p2    <- sum(alloch %in% p2_set) # Calculate the number of storm-introduced OTUs still present two weeks later
+
+# Calculate total relative abundance of storm-introduced taxa
+ps_alloch_storm <- prune_taxa(alloch, subset_samples(ps_rel, DM == storm_date)) # Prune to storm-introduced taxa in storm samples
+storm_rel_abund <- sample_sums(ps_alloch_storm) # Sum across taxa for each sample
+
+ps_alloch_p1 <- prune_taxa(alloch, subset_samples(ps_rel, DM == post1_date)) # Prune to storm-introduced taxa in post week 1 samples
+p1_rel_abund <- sample_sums(ps_alloch_p1) # Sum across taxa for each sample
+
+ps_alloch_p2 <- prune_taxa(alloch, subset_samples(ps_rel, DM == post2_date)) # Prune to storm-introduced taxa in post week 1 samples
+p2_rel_abund <- sample_sums(ps_alloch_p2) # Sum across taxa for each sample
+
+# Calculate mean and sd of storm-introduced relative abundances
+ps_alloch_total <- prune_taxa(alloch, ps_rel) # Prune total data set to storm-introduced taxa
+total_rel_abund <- sample_sums(ps_alloch_total) # Sum across taxa for each sample
+
+# Print results
+## No of storm-introduced OTUs in the whole dataset
+print(paste(round(n_alloch / ntaxa(ps_rel)*100,2), "% of all pond OTUs appeared only during the storm, representing",
+            round(sum(total_rel_abund)/sum(sample_sums(ps_rel))*100,2), "% of the total dataset releative abundance"))
+
+## No of OTUs present in storm assemblages
+print(paste(round(n_alloch / length(storm_set)*100,2),"% of storm OTUs were newly introduced (absent before the storm), representing a mean relative abundance of", round(mean(storm_rel_abund)*100,2), "±", round(sd(storm_rel_abund)*100,2),"% of storm assemblages")) 
+
+## No of OTUs present one week later
+print(paste("Storm-introduced OTUs made up",round(n_alloch_p1 / length(p1_set)*100, 2),"% of OTUs present one week later, representing a mean relative abundance of", round(mean(p1_rel_abund)*100,2), "±", round(sd(p1_rel_abund)*100,2),"% of 1 week post storm assemblages"))
+
+## No of OTUs present two weeks later
+print(paste("Storm-introduced OTUs made up",round(n_alloch_p2 / length(p2_set)*100, 2),"% of OTUs present two weeks later, representing a mean relative abundance of", round(mean(p2_rel_abund)*100,2), "±", round(sd(p2_rel_abund)*100,2),"% of 2 week post storm assemblages"))  
+
+```
+
+## Species Indicator Analysis
+```{r}
+# --- Agglomerate to genus and filter to classified ---
+ps_genus <- tax_glom(ps_rel, taxrank = "Genus", NArm = TRUE)
+genus_strings <- as.character(tax_table(ps_genus)[, "Genus"])
+classified <- !grepl(
+  "unclassified|uncultured|Unclassified Eukaryote|\\(F\\)|\\(O\\)|\\(C\\)|\\(P\\)",
+  genus_strings,
+  ignore.case = TRUE
+)
+ps_genus <- prune_taxa(classified, ps_genus)
+
+# --- Run multi-level pattern analysis ---
+# Genera as rows, samples as columns
+otu_classified <- as(otu_table(ps_genus), "matrix")
+if (!taxa_are_rows(ps_genus)) otu_classified <- t(otu_classified)
+
+# multipatt expects samples as rows
+otu_for_indval <- t(otu_classified)
+
+# Sample metadata aligned to OTU columns
+samp <- data.frame(sample_data(ps_genus))
+
+# Reproducible permutations
+set.seed(127)
+
+# Generalized IndVal; single dates AND date combinations
+indval <- multipatt(
+  otu_for_indval,
+  cluster = as.character(samp$DM),
+  func    = "IndVal.g",
+  duleg   = FALSE,
+  control = how(nperm = 999)
+)
+
+# --- Significance + strength filter ---
+sig_indicators <- indval$sign %>%
+  rownames_to_column("TaxonID") %>%
+  mutate(q.value = p.adjust(p.value, method = "fdr")) %>%
+  filter(stat > 0.7, p.value < 0.05, q.value < 0.05)
+
+# --- A (specificity) and B (fidelity) for each winning combo, via $sign$index ---
+sig_indicators <- sig_indicators %>%
+  mutate(
+    A = mapply(function(g, i) indval$A[g, i], TaxonID, index),
+    B = mapply(function(g, i) indval$B[g, i], TaxonID, index)
+  )
+
+# --- Parse "Indicator group" string from binary s.<group> columns ---
+group_cols  <- grep("^s\\.", colnames(sig_indicators), value = TRUE)
+group_names <- sub("^s\\.", "", group_cols)
+
+sig_indicators <- sig_indicators %>%
+  rowwise() %>%
+  mutate(
+    `Indicator group` = paste(
+      group_names[c_across(all_of(group_cols)) == 1],
+      collapse = " + "
+    )
+  ) %>%
+  ungroup()
+
+# --- Mean RA (%) within indicator-group samples ---
+relabund_scale <- if (max(otu_classified, na.rm = TRUE) > 1.5) 1 else 100
+
+otu_long <- as.data.frame(otu_classified) %>%
+  rownames_to_column("TaxonID") %>%
+  pivot_longer(-TaxonID, names_to = "Sample", values_to = "abund") %>%
+  left_join(
+    tibble(Sample = rownames(samp), DM = as.character(samp$DM)),
+    by = "Sample"
+  )
+
+group_lookup <- sig_indicators %>%
+  select(TaxonID, `Indicator group`) %>%
+  mutate(DM = strsplit(`Indicator group`, " \\+ ")) %>%
+  unnest(DM)
+
+mean_ra <- otu_long %>%
+  inner_join(group_lookup, by = c("TaxonID", "DM")) %>%
+  group_by(TaxonID, `Indicator group`) %>%
+  summarise(`Mean RA (%)` = mean(abund) * relabund_scale, .groups = "drop")
+
+# --- Taxonomy (TaxonID = phyloseq taxa name; Genus is a column in tax_table) ---
+tax_df <- as.data.frame(tax_table(ps_genus)) %>%
+  rownames_to_column("TaxonID") %>%
+  select(TaxonID, Division, Family, Genus)
+
+# --- Significance-only set (for tabulation; no IndVal/A/B/RA filters) ---
+indval_all <- indval$sign %>%
+  rownames_to_column("TaxonID") %>%
+  mutate(q.value = p.adjust(p.value, method = "fdr"))   # FDR over ALL tested genera
+
+# Universe actually entered into multipatt
+n_genera_tested <- nrow(indval_all)            # == ntaxa(ps_genus) unless any all-zero genera dropped
+
+# Significant date indicators (significance only)
+sig_only <- indval_all %>%
+  filter(p.value < 0.05, q.value < 0.05)
+n_sig_genera <- nrow(sig_only)
+
+# Attach the winning indicator-group label (single date or date-combination)
+group_cols  <- grep("^s\\.", colnames(sig_only), value = TRUE)
+group_names <- sub("^s\\.", "", group_cols)
+sig_only <- sig_only %>%
+  rowwise() %>%
+  mutate(`Indicator group` = paste(
+    group_names[c_across(all_of(group_cols)) == 1], collapse = " + "
+  )) %>%
+  ungroup()
+
+# (a) indicators per winning group (single dates AND combinations)
+indicators_by_group <- sig_only %>%
+  count(`Indicator group`, name = "n_indicator_genera") %>%
+  arrange(desc(n_indicator_genera))
+
+# (b) indicators attributable to each single date (counts a genus toward
+#     every date appearing in its winning combination)
+indicators_by_date <- tibble(DM = group_names) %>%
+  rowwise() %>%
+  mutate(n_indicator_genera = sum(sig_only[[paste0("s.", DM)]] == 1)) %>%
+  ungroup() %>%
+  arrange(desc(n_indicator_genera))
+
+message(paste("The number of genera tested was", n_genera_tested))
+message(paste("The number of significant indicator genera was ",n_sig_genera))
+indicators_by_group
+indicators_by_date
+
+# --- Final assembly ---
+(sia_tab <- sig_indicators %>%
+  left_join(tax_df, by = "TaxonID") %>%
+  left_join(mean_ra, by = c("TaxonID", "Indicator group")) %>%
+  transmute(
+    Division, Family, Genus,
+    `Indicator group`,
+    A      = round(A, 3),
+    B      = round(B, 3),
+    IndVal = round(stat, 3),
+    `p-value` = signif(q.value, 3),
+    `Mean RA (%)` = round(`Mean RA (%)`, 2)
+  ) %>%
+  arrange(`Indicator group`, desc(IndVal)))
+
+sia_tab_filt <- sia_tab %>%
+  filter(A >= 0.8, B >= 0.7, `Mean RA (%)` >= 0.6)
+
+# --- Export ---
+write.csv(
+  sia_tab_filt,
+  file.path(output_path, "s18_species_indicators_genera.csv"),
+  row.names = FALSE
+)
+
+sia_tab_filt
+```
+
+

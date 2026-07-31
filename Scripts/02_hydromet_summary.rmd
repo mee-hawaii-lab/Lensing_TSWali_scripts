@@ -1,0 +1,1287 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Summary statistics for meteorological, hydrological, and ctd data
+
+*Sources:*
+* Wind speed and direction: NOAA Buoy, Moku o Loʻe, Oʻahu, HI (Station MOKH1; 21.433°N, 157.790°W) 
+* Precipitation: PacIOOS meteorological station, on Moku o Loʻe, Oʻahu, HI (Station HIMB; 21.433°N, 157.786°W)
+* Stream discharge: USGS National Water Information System, Haʻikū Valley, Kāneʻohe, HI (Station 16275000; 21.409°N, 157.823°W; elevation 82.9 m)
+* Pressure, Salinity, Temperature, and Current speed and direction: In-situ instrument package (21.43917°N, 157.80821°W)
+
+```{r}
+# ---- Load libraries ----
+library(readr)
+library(dplyr)
+library(lubridate)
+library(hms)
+library(stringr)
+library(tidyr)
+library(purrr)
+library(tidyverse)
+
+
+# ---- Set file paths ----
+input_path_1 <- '/Users/becca/Documents/current projects/Manuscript Storm Wali/data/raw/hydrometeorology'
+input_path_2 <- '/Users/becca/Documents/current projects/Manuscript Storm Wali/data/processed/hydrometeorology/ctd_extracted_data'
+output_path  <- '/Users/becca/Documents/current projects/Manuscript Storm Wali/output/table_supp2_hydrometeoro_summ'
+```
+
+## NOAA buoy data (wind speed and direction)
+```{r}
+# Helper function: circular mean for degrees
+circular_mean_deg <- function(x_deg) {
+  x <- x_deg[!is.na(x_deg)] * pi/180
+  if (length(x) == 0) return(NA_real_)
+  mu <- atan2(mean(sin(x)), mean(cos(x)))
+  (mu * 180/pi) %% 360
+}
+
+# Helper function: circular sd for degrees
+circular_sd_deg <- function(x_deg) {
+  x <- x_deg[!is.na(x_deg)] * pi/180
+  if (length(x) < 2) return(NA_real_)
+  R <- sqrt(mean(cos(x))^2 + mean(sin(x))^2)
+  sqrt(-2 * log(R)) * 180/pi
+}
+
+# Helper: minimum circular difference (deg)
+circular_diff_deg <- function(a, b) {
+  raw_diff <- abs(a - b)
+  pmin(raw_diff, 360 - raw_diff)
+}
+
+# Helper: first recovery day for scalar variable using daily mean within pre mean ± 1 SD
+first_recovery_day_scalar <- function(df_daily, value_col,
+                                      pre_start, pre_end, storm_end, post_end) {
+  df_pre <- df_daily %>% filter(date >= pre_start, date <= pre_end)
+  if (nrow(df_pre) == 0) {
+    return(tibble(recovery_day = NA_Date_, days_to_recovery = NA_integer_,
+                  status = "No pre-storm baseline days"))
+  }
+
+  xpre <- df_pre[[value_col]]
+  pre_mean <- mean(xpre, na.rm = TRUE)
+  pre_sd   <- sd(xpre, na.rm = TRUE)
+
+  lower <- pre_mean - pre_sd
+  upper <- pre_mean + pre_sd
+
+  df_post <- df_daily %>%
+    filter(date > storm_end, date <= post_end) %>%
+    arrange(date) %>%
+    mutate(ok = .data[[value_col]] >= lower & .data[[value_col]] <= upper)
+
+  hit <- df_post %>% filter(ok) %>% slice(1)
+
+  if (nrow(hit) == 0) {
+    return(tibble(recovery_day = NA_Date_, days_to_recovery = NA_integer_,
+                  status = "Did not return within observation window"))
+  }
+
+  tibble(
+    recovery_day = hit$date,
+    days_to_recovery = as.integer(hit$date - storm_end),
+    status = "Recovered"
+  )
+}
+
+# Helper: first recovery day for direction using daily circular mean within circular mean ± circular SD
+first_recovery_day_direction <- function(df_daily, dir_col,
+                                         pre_start, pre_end, storm_end, post_end) {
+  df_pre <- df_daily %>% filter(date >= pre_start, date <= pre_end)
+  if (nrow(df_pre) == 0) {
+    return(tibble(recovery_day = NA_Date_, days_to_recovery = NA_integer_,
+                  status = "No pre-storm baseline days"))
+  }
+
+  mu <- circular_mean_deg(df_pre[[dir_col]])
+  sd <- circular_sd_deg(df_pre[[dir_col]])
+
+  df_post <- df_daily %>%
+    filter(date > storm_end, date <= post_end) %>%
+    arrange(date) %>%
+    mutate(ok = circular_diff_deg(.data[[dir_col]], mu) <= sd)
+
+  hit <- df_post %>% filter(ok) %>% slice(1)
+
+  if (nrow(hit) == 0) {
+    return(tibble(recovery_day = NA_Date_, days_to_recovery = NA_integer_,
+                  status = "Did not return within observation window"))
+  }
+
+  tibble(
+    recovery_day = hit$date,
+    days_to_recovery = as.integer(hit$date - storm_end),
+    status = "Recovered"
+  )
+}
+
+# Main function (now returns both stats + recovery)
+summarize_buoy_wind <- function(file_path,
+                               buoy_tz = "UTC",
+                               phase_tz = "Pacific/Honolulu",
+                               circular_dir = TRUE,
+                               pre_start = as.Date("2014-07-06"),
+                               pre_end   = as.Date("2014-07-19"),
+                               storm_start = as.Date("2014-07-20"),
+                               storm_end   = as.Date("2014-07-21"),
+                               post_start  = as.Date("2014-07-22"),
+                               post_end    = as.Date("2014-08-12")) {
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  # Drop the metadata + units rows (e.g., "#yr", "deg", "m/s")
+  df <- df %>% filter(str_detect(`#YY`, "^\\d{4}$"))
+
+  df2 <- df %>%
+    transmute(
+      year = as.integer(`#YY`),
+      mo   = as.integer(MM),
+      dy   = as.integer(DD),
+      hr   = as.integer(hh),
+      mn   = as.integer(mm),
+      wind_direction = as.numeric(WDI),
+      wind_speed     = as.numeric(`R WSP`)
+    ) %>%
+    mutate(
+      # NDBC missing codes (common): 999 for direction, 99 for speed
+      wind_speed     = if_else(!is.na(wind_speed)     & wind_speed     >=  99, NA_real_, wind_speed),
+      wind_direction = if_else(!is.na(wind_direction) & wind_direction >= 999, NA_real_, wind_direction),
+
+      datetime_utc = make_datetime(year, mo, dy, hr, mn, tz = buoy_tz),
+      date_local   = as.Date(with_tz(datetime_utc, tzone = phase_tz)),
+
+      phase = case_when(
+        date_local >= pre_start   & date_local <= pre_end   ~ "pre-storm",
+        date_local >= storm_start & date_local <= storm_end ~ "storm",
+        date_local >= post_start  & date_local <= post_end  ~ "post-storm",
+        TRUE ~ NA_character_
+      )
+    )
+
+  # Keep a phase-filtered version for summary stats
+  df_phase <- df2 %>% filter(!is.na(phase))
+
+  if (nrow(df_phase) == 0) {
+    stop("No rows fell within storm windows after parsing/filtering.")
+  }
+
+  # --- summarize wind speed (scalar per phase) ---
+  speed_sum <- df_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "wind_speed",
+      mean = if (all(is.na(wind_speed))) NA_real_ else mean(wind_speed, na.rm = TRUE),
+      sd   = if (sum(!is.na(wind_speed)) < 2) NA_real_ else sd(wind_speed, na.rm = TRUE),
+      min  = if (all(is.na(wind_speed))) NA_real_ else min(wind_speed, na.rm = TRUE),
+      max  = if (all(is.na(wind_speed))) NA_real_ else max(wind_speed, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # --- summarize wind direction (circular stats by default) ---
+  dir_sum <- df_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "wind_direction",
+      mean = if (circular_dir) circular_mean_deg(wind_direction)
+      else if (all(is.na(wind_direction))) NA_real_ else mean(wind_direction, na.rm = TRUE),
+      sd   = if (circular_dir) circular_sd_deg(wind_direction)
+      else if (sum(!is.na(wind_direction)) < 2) NA_real_ else sd(wind_direction, na.rm = TRUE),
+      min  = if (all(is.na(wind_direction))) NA_real_ else min(wind_direction, na.rm = TRUE),
+      max  = if (all(is.na(wind_direction))) NA_real_ else max(wind_direction, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  summary_long <- bind_rows(speed_sum, dir_sum) %>%
+    mutate(phase = factor(phase, levels = c("pre-storm", "storm", "post-storm"))) %>%
+    arrange(variable, phase)
+
+  summary_wide <- summary_long %>%
+    pivot_wider(
+      names_from = phase,
+      values_from = c(mean, sd, min, max),
+      names_glue = "{phase}_{.value}"
+    ) %>%
+    select(
+      variable,
+      `pre-storm_mean`, `pre-storm_sd`, `pre-storm_min`, `pre-storm_max`,
+      `storm_mean`,     `storm_sd`,     `storm_min`,     `storm_max`,
+      `post-storm_mean`,`post-storm_sd`,`post-storm_min`,`post-storm_max`
+    )
+
+  # -----------------------
+  # Recovery time (daily series)
+  # -----------------------
+  wind_speed_daily <- df2 %>%
+    group_by(date = date_local) %>%
+    summarize(wind_speed = mean(wind_speed, na.rm = TRUE), .groups = "drop")
+
+  wind_dir_daily <- df2 %>%
+    group_by(date = date_local) %>%
+    summarize(wind_direction = circular_mean_deg(wind_direction), .groups = "drop")
+
+  rec_speed <- first_recovery_day_scalar(
+    wind_speed_daily, value_col = "wind_speed",
+    pre_start = pre_start, pre_end = pre_end, storm_end = storm_end, post_end = post_end
+  ) %>%
+    mutate(variable = "wind_speed")
+
+  rec_dir <- first_recovery_day_direction(
+    wind_dir_daily, dir_col = "wind_direction",
+    pre_start = pre_start, pre_end = pre_end, storm_end = storm_end, post_end = post_end
+  ) %>%
+    mutate(variable = "wind_direction")
+
+  recovery_tbl <- bind_rows(rec_speed, rec_dir) %>%
+    select(variable, recovery_day, days_to_recovery, status)
+
+  # Return both objects (print either one as needed)
+  list(
+    stats = summary_wide,
+    recovery = recovery_tbl
+  )
+}
+
+# --- Run function ---
+buoy_out <- summarize_buoy_wind(file.path(input_path_1, "noaa_buoy_mokh1_wind.csv"))
+
+buoy_out$stats
+buoy_out$recovery
+```
+
+## HIMB rain gauge
+```{r}
+summarize_precipitation_daily <- function(file_path,
+                                         data_tz = "Pacific/Honolulu",
+                                         pre_start   = as.Date("2014-07-06"),
+                                         pre_end     = as.Date("2014-07-19"),
+                                         storm_start = as.Date("2014-07-20"),
+                                         storm_end   = as.Date("2014-07-21"),
+                                         post_start  = as.Date("2014-07-22"),
+                                         post_end    = as.Date("2014-08-12")) {
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  df_daily_all <- df %>%
+    mutate(
+      # Safely parse datetime (silences unit-row warning)
+      datetime = suppressWarnings(ymd_hms(time, tz = data_tz)),
+      date = as.Date(datetime),
+
+      # Force rainfall to numeric (handles unit row like "mm")
+      rainfall_mm = suppressWarnings(readr::parse_number(as.character(rainfall_amount))),
+
+      # Convert mm → cm
+      rainfall_cm = rainfall_mm / 10
+    ) %>%
+    # Drop rows that failed parsing (units/header rows)
+    filter(!is.na(date), !is.na(rainfall_cm)) %>%
+    # ---- DAILY TOTALS ----
+    group_by(date) %>%
+    summarize(
+      daily_precip_cm = sum(rainfall_cm, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # ---- Recovery (baseline daily totals) ----
+  # baseline = pre-storm daily totals; recovery day = first post-storm day <= max(pre-storm daily)
+  pre_daily <- df_daily_all %>% filter(date >= pre_start, date <= pre_end)
+
+  if (nrow(pre_daily) == 0) {
+    recovery_tbl <- tibble(
+      variable = "precipitation_cmpd",
+      recovery_day = NA_Date_,
+      days_to_recovery = NA_integer_,
+      status = "No pre-storm baseline days"
+    )
+  } else {
+    pre_max <- max(pre_daily$daily_precip_cm, na.rm = TRUE)
+
+    post_daily <- df_daily_all %>%
+      filter(date > storm_end, date <= post_end) %>%
+      arrange(date) %>%
+      mutate(ok = daily_precip_cm <= pre_max)
+
+    hit <- post_daily %>% filter(ok) %>% slice(1)
+
+    recovery_tbl <- if (nrow(hit) == 0) {
+      tibble(
+        variable = "precipitation_cmpd",
+        recovery_day = NA_Date_,
+        days_to_recovery = NA_integer_,
+        status = "Did not return within observation window"
+      )
+    } else {
+      tibble(
+        variable = "precipitation_cmpd",
+        recovery_day = hit$date,
+        days_to_recovery = as.integer(hit$date - storm_end),
+        status = "Recovered"
+      )
+    }
+  }
+
+  # ---- Phase assignment for summary stats ----
+  df_daily_phase <- df_daily_all %>%
+    mutate(
+      phase = case_when(
+        date >= pre_start   & date <= pre_end   ~ "pre-storm",
+        date >= storm_start & date <= storm_end ~ "storm",
+        date >= post_start  & date <= post_end  ~ "post-storm",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(phase))
+
+  if (nrow(df_daily_phase) == 0) {
+    stop("No daily precipitation values fall within storm windows.")
+  }
+
+  summary_long <- df_daily_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "precipitation_cmpd",
+      mean = mean(daily_precip_cm, na.rm = TRUE),
+      sd   = if (n() < 2) NA_real_ else sd(daily_precip_cm, na.rm = TRUE),
+      min  = min(daily_precip_cm, na.rm = TRUE),
+      max  = max(daily_precip_cm, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(phase = factor(phase, levels = c("pre-storm","storm","post-storm")))
+
+  summary_wide <- summary_long %>%
+    pivot_wider(
+      names_from = phase,
+      values_from = c(mean, sd, min, max),
+      names_glue = "{phase}_{.value}"
+    ) %>%
+    select(
+      variable,
+      `pre-storm_mean`, `pre-storm_sd`, `pre-storm_min`, `pre-storm_max`,
+      `storm_mean`,     `storm_sd`,     `storm_min`,     `storm_max`,
+      `post-storm_mean`,`post-storm_sd`,`post-storm_min`,`post-storm_max`
+    )
+
+  # Return both
+  list(
+    stats = summary_wide,
+    recovery = recovery_tbl
+  )
+}
+
+# --- Run function ---
+rain_out <- summarize_precipitation_daily(
+  file.path(input_path_1, "pacioos_himb_rain_gauge.csv")
+)
+
+rain_out$stats
+rain_out$recovery
+```
+
+## USGS stream gauge
+```{r}
+summarize_stream_daily <- function(file_path,
+                                  data_tz = "Pacific/Honolulu",
+                                  pre_start   = as.Date("2014-07-06"),
+                                  pre_end     = as.Date("2014-07-19"),
+                                  storm_start = as.Date("2014-07-20"),
+                                  storm_end   = as.Date("2014-07-21"),
+                                  post_start  = as.Date("2014-07-22"),
+                                  post_end    = as.Date("2014-08-12")) {
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  # ---- Build DAILY SERIES (all dates; do not filter to phases yet) ----
+  df_daily_all <- df %>%
+    # Keep only real USGS data rows
+    filter(!is.na(agency), toupper(agency) == "USGS") %>%
+    mutate(
+      # Parse discharge
+      discharge_cfs = suppressWarnings(readr::parse_number(as.character(Discharge))),
+
+      # Convert cfs -> m^3/s
+      discharge_m3s = discharge_cfs * 0.0283168466,
+
+      # Build datetime from separate date + time columns
+      datetime = suppressWarnings(mdy_hm(paste(date, time), tz = data_tz)),
+      date_only = as.Date(datetime)
+    ) %>%
+    filter(!is.na(date_only), !is.na(discharge_m3s)) %>%
+    group_by(date_only) %>%
+    summarize(
+      daily_mean_discharge_m3s = mean(discharge_m3s, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # ---- Recovery (baseline daily totals analog) ----
+  pre_daily <- df_daily_all %>% filter(date_only >= pre_start, date_only <= pre_end)
+
+  if (nrow(pre_daily) == 0) {
+    recovery_tbl <- tibble(
+      variable = "stream_discharge_m3s",
+      recovery_day = NA_Date_,
+      days_to_recovery = NA_integer_,
+      status = "No pre-storm baseline days"
+    )
+  } else {
+    pre_max <- max(pre_daily$daily_mean_discharge_m3s, na.rm = TRUE)
+
+    post_daily <- df_daily_all %>%
+      filter(date_only > storm_end, date_only <= post_end) %>%
+      arrange(date_only) %>%
+      mutate(ok = daily_mean_discharge_m3s <= pre_max)
+
+    hit <- post_daily %>% filter(ok) %>% slice(1)
+
+    recovery_tbl <- if (nrow(hit) == 0) {
+      tibble(
+        variable = "stream_discharge_m3s",
+        recovery_day = NA_Date_,
+        days_to_recovery = NA_integer_,
+        status = "Did not return within observation window"
+      )
+    } else {
+      tibble(
+        variable = "stream_discharge_m3s",
+        recovery_day = hit$date_only,
+        days_to_recovery = as.integer(hit$date_only - storm_end),
+        status = "Recovered"
+      )
+    }
+  }
+
+  # ---- Phase assignment for summary stats ----
+  df_daily_phase <- df_daily_all %>%
+    mutate(
+      phase = case_when(
+        date_only >= pre_start   & date_only <= pre_end   ~ "pre-storm",
+        date_only >= storm_start & date_only <= storm_end ~ "storm",
+        date_only >= post_start  & date_only <= post_end  ~ "post-storm",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(phase))
+
+  if (nrow(df_daily_phase) == 0) {
+    stop("No daily discharge values fall within storm windows.")
+  }
+
+  summary_long <- df_daily_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "stream_discharge_m3s",
+      mean = mean(daily_mean_discharge_m3s, na.rm = TRUE),
+      sd   = if (n() < 2) NA_real_ else sd(daily_mean_discharge_m3s, na.rm = TRUE),
+      min  = min(daily_mean_discharge_m3s, na.rm = TRUE),
+      max  = max(daily_mean_discharge_m3s, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(phase = factor(phase, levels = c("pre-storm","storm","post-storm")))
+
+  summary_wide <- summary_long %>%
+    pivot_wider(
+      names_from = phase,
+      values_from = c(mean, sd, min, max),
+      names_glue = "{phase}_{.value}"
+    ) %>%
+    select(
+      variable,
+      `pre-storm_mean`, `pre-storm_sd`, `pre-storm_min`, `pre-storm_max`,
+      `storm_mean`,     `storm_sd`,     `storm_min`,     `storm_max`,
+      `post-storm_mean`,`post-storm_sd`,`post-storm_min`,`post-storm_max`
+    )
+
+  list(
+    stats = summary_wide,
+    recovery = recovery_tbl
+  )
+}
+
+# --- Run function ---
+stream_out <- summarize_stream_daily(
+  file.path(input_path_1, "usgs_stream_gauge.csv")
+)
+
+stream_out$stats
+stream_out$recovery
+```
+
+## CTD data (salinity, temperature, pressure)
+```{r}
+summarize_ctd_file <- function(file_path,
+                               tz = "Pacific/Honolulu",
+                               pre_start   = as.Date("2014-07-06"),
+                               pre_end     = as.Date("2014-07-19"),
+                               storm_start = as.Date("2014-07-20"),
+                               storm_end   = as.Date("2014-07-21"),
+                               post_start  = as.Date("2014-07-22"),
+                               post_end    = as.Date("2014-08-12")) {
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  # value column = everything except datetime
+  value_col <- setdiff(names(df), "datetime")
+  if (length(value_col) != 1) {
+    stop("File must contain exactly one value column besides 'datetime'")
+  }
+  value_col <- value_col[[1]]
+
+  variable_name <- basename(file_path) |>
+    str_remove("^extracted_") |>
+    str_remove("^ctd_extracted_") |>
+    str_remove("\\.csv$")
+
+  df2 <- df |>
+    mutate(
+      # Robust parse to POSIXct, then Date
+      datetime_parsed = case_when(
+        inherits(datetime, "POSIXt") ~ as.POSIXct(datetime, tz = tz),
+        TRUE ~ {
+          dt_chr <- str_squish(str_replace_all(as.character(datetime), "\u00A0", " "))
+          # handle common formats: mdy HMS p, mdy HM p, mdy HMS, mdy HM, ymd HMS, ymd HM
+          suppressWarnings(parse_date_time(
+            dt_chr,
+            orders = c("mdy HMS p", "mdy HM p", "mdy HMS", "mdy HM",
+                       "ymd HMS", "ymd HM"),
+            tz = tz
+          ))
+        }
+      ),
+      date = as.Date(datetime_parsed),
+
+      phase = case_when(
+        date >= pre_start   & date <= pre_end   ~ "pre-storm",
+        date >= storm_start & date <= storm_end ~ "storm",
+        date >= post_start  & date <= post_end  ~ "post-storm",
+        TRUE ~ NA_character_
+      )
+    )
+
+  if (all(is.na(df2$date))) {
+    stop("All dates are NA after parsing. Example datetime values:\n",
+         paste(head(as.character(df$datetime), 5), collapse = "\n"))
+  }
+
+  # -------------------------
+  # Phase summary stats (as you had)
+  # -------------------------
+  df_summary_long <- df2 |>
+    filter(!is.na(phase)) |>
+    group_by(variable = variable_name, phase) |>
+    summarize(
+      n    = sum(!is.na(.data[[value_col]])),
+      mean = if (n > 0) mean(.data[[value_col]], na.rm = TRUE) else NA_real_,
+      sd   = if (n > 1) sd(.data[[value_col]], na.rm = TRUE) else NA_real_,
+      min  = if (n > 0) min(.data[[value_col]], na.rm = TRUE) else NA_real_,
+      max  = if (n > 0) max(.data[[value_col]], na.rm = TRUE) else NA_real_,
+      .groups = "drop"
+    ) |>
+    mutate(phase = factor(phase, levels = c("pre-storm", "storm", "post-storm"))) |>
+    arrange(variable, phase)
+
+  if (nrow(df_summary_long) == 0) {
+    rng <- range(df2$date, na.rm = TRUE)
+    stop(
+      "No rows fell within the specified storm windows.\n",
+      "Observed date range in this file: ", rng[1], " to ", rng[2], "\n",
+      "Check that this instrument file actually covers 2014-07-05 to 2014-08-12."
+    )
+  }
+
+  df_summary_wide <- df_summary_long |>
+    select(-n) |>
+    pivot_wider(
+      names_from = phase,
+      values_from = c(mean, sd, min, max),
+      names_glue = "{phase}_{.value}"
+    ) |>
+    select(
+      variable,
+      `pre-storm_mean`, `pre-storm_sd`, `pre-storm_min`, `pre-storm_max`,
+      `storm_mean`,     `storm_sd`,     `storm_min`,     `storm_max`,
+      `post-storm_mean`,`post-storm_sd`,`post-storm_min`,`post-storm_max`
+    )
+
+  # -------------------------
+  # Recovery (daily mean returns to pre mean ± 1 SD)
+  # -------------------------
+  df_daily <- df2 |>
+    filter(!is.na(date), !is.na(.data[[value_col]])) |>
+    group_by(date) |>
+    summarize(daily_mean = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop")
+
+  pre_daily <- df_daily |>
+    filter(date >= pre_start, date <= pre_end)
+
+  recovery_tbl <- if (nrow(pre_daily) == 0) {
+    tibble(
+      variable = variable_name,
+      recovery_day = NA_Date_,
+      days_to_recovery = NA_integer_,
+      status = "No pre-storm baseline days"
+    )
+  } else {
+    pre_mu <- mean(pre_daily$daily_mean, na.rm = TRUE)
+    pre_sd <- sd(pre_daily$daily_mean, na.rm = TRUE)
+    lower <- pre_mu - pre_sd
+    upper <- pre_mu + pre_sd
+
+    post_daily <- df_daily |>
+      filter(date > storm_end, date <= post_end) |>
+      arrange(date) |>
+      mutate(ok = daily_mean >= lower & daily_mean <= upper)
+
+    hit <- post_daily |>
+      filter(ok) |>
+      slice(1)
+
+    if (nrow(hit) == 0) {
+      tibble(
+        variable = variable_name,
+        recovery_day = NA_Date_,
+        days_to_recovery = NA_integer_,
+        status = "Did not return within observation window"
+      )
+    } else {
+      tibble(
+        variable = variable_name,
+        recovery_day = hit$date,
+        days_to_recovery = as.integer(hit$date - storm_end),
+        status = "Recovered"
+      )
+    }
+  }
+
+  list(
+    stats = df_summary_wide,
+    recovery = recovery_tbl
+  )
+}
+
+ctd_out <- list(
+  summarize_ctd_file(file.path(input_path_2, "ctd_extracted_pressure.csv")),
+  summarize_ctd_file(file.path(input_path_2, "ctd_extracted_salinity.csv")),
+  summarize_ctd_file(file.path(input_path_2, "ctd_extracted_temperature.csv")),
+  summarize_ctd_file(file.path(input_path_2, "ctd_extracted_turbidity.csv"))
+)
+
+ctd_stats <- bind_rows(lapply(ctd_out, `[[`, "stats"))
+ctd_recovery <- bind_rows(lapply(ctd_out, `[[`, "recovery"))
+
+ctd_stats
+ctd_recovery
+```
+
+## CTD data (current speed and direction)
+```{r}
+# ---- circular helpers ----
+circular_mean_deg <- function(x_deg) {
+  x <- x_deg[!is.na(x_deg)] * pi/180
+  if (length(x) == 0) return(NA_real_)
+  mu <- atan2(mean(sin(x)), mean(cos(x)))
+  (mu * 180/pi) %% 360
+}
+
+circular_sd_deg <- function(x_deg) {
+  x <- x_deg[!is.na(x_deg)] * pi/180
+  if (length(x) < 2) return(NA_real_)
+  R <- sqrt(mean(cos(x))^2 + mean(sin(x))^2)
+  sqrt(-2 * log(R)) * 180/pi
+}
+
+circular_diff_deg <- function(a, b) {
+  raw_diff <- abs(a - b)
+  pmin(raw_diff, 360 - raw_diff)
+}
+
+summarize_ctd_current <- function(file_path,
+                                  tz = "Pacific/Honolulu",
+                                  pre_start   = as.Date("2014-07-06"),
+                                  pre_end     = as.Date("2014-07-19"),
+                                  storm_start = as.Date("2014-07-20"),
+                                  storm_end   = as.Date("2014-07-21"),
+                                  post_start  = as.Date("2014-07-22"),
+                                  post_end    = as.Date("2014-08-12")) {
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  if (!("datetime" %in% names(df))) {
+    stop("No 'datetime' column found. Columns are: ", paste(names(df), collapse = ", "))
+  }
+
+  df2 <- df %>%
+    mutate(
+      date = case_when(
+        inherits(datetime, "POSIXt") ~ as.Date(datetime),
+        TRUE ~ {
+          dt_chr <- str_squish(str_replace_all(as.character(datetime), "\u00A0", " "))
+
+          # Try common datetime formats (including 2-digit year + HM)
+          dt <- suppressWarnings(mdy_hm(dt_chr, tz = tz))                         # 6/10/14 18:25
+          dt <- coalesce(dt, suppressWarnings(mdy_hms(dt_chr, tz = tz)))          # 6/10/2014 18:25:30
+          dt <- coalesce(dt, suppressWarnings(parse_date_time(
+            dt_chr, orders = c("mdy HMS p","mdy HM p"), tz = tz
+          )))                                                                      # 6/11/2014 9:52:30 AM
+          dt <- coalesce(dt, suppressWarnings(ymd_hms(dt_chr, tz = tz)))          # 2014-06-10 11:34:25
+          dt <- coalesce(dt, suppressWarnings(ymd_hm(dt_chr, tz = tz)))           # 2014-06-10 11:34
+
+          as.Date(dt)
+        }
+      ),
+      phase = case_when(
+        date >= pre_start   & date <= pre_end   ~ "pre-storm",
+        date >= storm_start & date <= storm_end ~ "storm",
+        date >= post_start  & date <= post_end  ~ "post-storm",
+        TRUE ~ NA_character_
+      )
+    )
+
+  if (all(is.na(df2$date))) {
+    stop("All dates are NA after parsing. Example datetime values:\n",
+         paste(head(as.character(df$datetime), 5), collapse = "\n"))
+  }
+
+  df_phase <- df2 %>% filter(!is.na(phase))
+
+  if (nrow(df_phase) == 0) {
+    rng <- range(df2$date, na.rm = TRUE)
+    stop(
+      "No CTD current data fall within storm windows after parsing.\n",
+      "Observed date range in this file: ", rng[1], " to ", rng[2]
+    )
+  }
+
+  # -------------------------
+  # Phase summary stats
+  # -------------------------
+  speed_sum <- df_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "current_speed_ms",
+      mean = mean(current_speed_ms, na.rm = TRUE),
+      sd   = if (sum(!is.na(current_speed_ms)) < 2) NA_real_ else sd(current_speed_ms, na.rm = TRUE),
+      min  = min(current_speed_ms, na.rm = TRUE),
+      max  = max(current_speed_ms, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  dir_sum <- df_phase %>%
+    group_by(phase) %>%
+    summarize(
+      variable = "current_direction_deg",
+      mean = circular_mean_deg(current_direction_deg),
+      sd   = circular_sd_deg(current_direction_deg),
+      min  = min(current_direction_deg, na.rm = TRUE),
+      max  = max(current_direction_deg, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  stats_wide <- bind_rows(speed_sum, dir_sum) %>%
+    mutate(phase = factor(phase, levels = c("pre-storm","storm","post-storm"))) %>%
+    pivot_wider(
+      names_from = phase,
+      values_from = c(mean, sd, min, max),
+      names_glue = "{phase}_{.value}"
+    ) %>%
+    select(
+      variable,
+      `pre-storm_mean`, `pre-storm_sd`, `pre-storm_min`, `pre-storm_max`,
+      `storm_mean`,     `storm_sd`,     `storm_min`,     `storm_max`,
+      `post-storm_mean`,`post-storm_sd`,`post-storm_min`,`post-storm_max`
+    )
+
+  # -------------------------
+  # Recovery (DAILY series)
+  # -------------------------
+  # Daily mean speed
+  speed_daily <- df2 %>%
+    filter(!is.na(date), !is.na(current_speed_ms)) %>%
+    group_by(date) %>%
+    summarize(daily_speed = mean(current_speed_ms, na.rm = TRUE), .groups = "drop")
+
+  # Daily circular mean direction
+  dir_daily <- df2 %>%
+    filter(!is.na(date), !is.na(current_direction_deg)) %>%
+    group_by(date) %>%
+    summarize(daily_dir = circular_mean_deg(current_direction_deg), .groups = "drop")
+
+  # Speed recovery: within pre mean ± 1 SD
+  pre_speed <- speed_daily %>% filter(date >= pre_start, date <= pre_end)
+
+  rec_speed <- if (nrow(pre_speed) == 0) {
+    tibble(variable = "current_speed_ms",
+           recovery_day = NA_Date_,
+           days_to_recovery = NA_integer_,
+           status = "No pre-storm baseline days")
+  } else {
+    mu <- mean(pre_speed$daily_speed, na.rm = TRUE)
+    s  <- sd(pre_speed$daily_speed, na.rm = TRUE)
+    lower <- mu - s
+    upper <- mu + s
+
+    hit <- speed_daily %>%
+      filter(date > storm_end, date <= post_end) %>%
+      arrange(date) %>%
+      mutate(ok = daily_speed >= lower & daily_speed <= upper) %>%
+      filter(ok) %>%
+      slice(1)
+
+    if (nrow(hit) == 0) {
+      tibble(variable = "current_speed_ms",
+             recovery_day = NA_Date_,
+             days_to_recovery = NA_integer_,
+             status = "Did not return within observation window")
+    } else {
+      tibble(variable = "current_speed_ms",
+             recovery_day = hit$date,
+             days_to_recovery = as.integer(hit$date - storm_end),
+             status = "Recovered")
+    }
+  }
+
+  # Direction recovery: within circular mean ± circular SD (minimum angular difference)
+  pre_dir <- dir_daily %>% filter(date >= pre_start, date <= pre_end)
+
+  rec_dir <- if (nrow(pre_dir) == 0) {
+    tibble(variable = "current_direction_deg",
+           recovery_day = NA_Date_,
+           days_to_recovery = NA_integer_,
+           status = "No pre-storm baseline days")
+  } else {
+    mu <- circular_mean_deg(pre_dir$daily_dir)
+    s  <- circular_sd_deg(pre_dir$daily_dir)
+
+    hit <- dir_daily %>%
+      filter(date > storm_end, date <= post_end) %>%
+      arrange(date) %>%
+      mutate(ok = circular_diff_deg(daily_dir, mu) <= s) %>%
+      filter(ok) %>%
+      slice(1)
+
+    if (nrow(hit) == 0) {
+      tibble(variable = "current_direction_deg",
+             recovery_day = NA_Date_,
+             days_to_recovery = NA_integer_,
+             status = "Did not return within observation window")
+    } else {
+      tibble(variable = "current_direction_deg",
+             recovery_day = hit$date,
+             days_to_recovery = as.integer(hit$date - storm_end),
+             status = "Recovered")
+    }
+  }
+
+  recovery_tbl <- bind_rows(rec_speed, rec_dir)
+
+  list(
+    stats = stats_wide,
+    recovery = recovery_tbl
+  )
+}
+
+# --- Run function ---
+ctd_current_out <- summarize_ctd_current(file.path(input_path_2, "ctd_extracted_current.csv"))
+ctd_current_out$stats
+ctd_current_out$recovery
+```
+
+# All together
+```{r}
+(all_stats <- bind_rows(
+  buoy_out$stats,
+  rain_out$stats,
+  stream_out$stats,
+  ctd_stats,              
+  ctd_current_out$stats
+))
+
+sig_figs <- list(
+  # Meteorological
+  wind_speed            = 1,  # m/s
+  wind_direction        = 0,  # degrees (circular mean)
+  
+  # Hydrological
+  precipitation_cm_day  = 1,  # cm/day
+  stream_discharge_m3s  = 3,  # m^3/s daily mean
+  
+  # CTD hydrography
+  pressure_dbar         = 2,  # dbar
+  salinity              = 2,  # PSU
+  temperature_C         = 2,  # °C
+  turbidity             = 1,  # NTU
+  
+  # CTD circulation (new)
+  current_speed_ms      = 3,  # m/s (values ~0.06)
+  current_direction_deg = 0   # degrees (circular mean)
+)
+```
+
+# Calculate absolute and fold-changes
+```{r}
+# Circular difference helper
+circular_diff_deg <- function(a, b) {
+  raw_diff <- abs(a - b)
+  pmin(raw_diff, 360 - raw_diff)
+}
+
+# helper to format numbers with per-row digits (character output)
+fmt_mean_sd_vec <- function(mean_vec, sd_vec, digits_vec) {
+  mapply(
+    function(m, s, d) {
+      if (is.na(m)) return(NA_character_)
+      m_fmt <- sprintf(paste0("%.", d, "f"), m)
+      s_fmt <- if (is.na(s)) "NA" else sprintf(paste0("%.", d, "f"), s)
+      paste0(m_fmt, " ± ", s_fmt)
+    },
+    mean_vec, sd_vec, digits_vec,
+    USE.NAMES = FALSE
+  )
+}
+
+fmt_num_vec <- function(x, digits_vec) {
+  mapply(
+    function(val, d) if (is.na(val)) NA_character_ else sprintf(paste0("%.", d, "f"), val),
+    x, digits_vec,
+    USE.NAMES = FALSE
+  )
+}
+
+(all_stats_final <- all_stats %>%
+  mutate(
+    digits = purrr::map_int(variable, ~{
+      d <- sig_figs[[.x]]
+      if (is.null(d)) 2L else as.integer(d)
+    }),
+    is_direction = stringr::str_detect(variable, "direction"),
+
+    # full precision differences first
+    delta_pre_storm      = storm_mean - `pre-storm_mean`,
+    delta_storm_post     = `post-storm_mean` - storm_mean,
+    fold_pre_storm       = if_else(is_direction, NA_real_, storm_mean / `pre-storm_mean`),
+    fold_storm_post      = if_else(is_direction, NA_real_, `post-storm_mean` / storm_mean),
+    circ_diff_pre_storm  = if_else(is_direction, circular_diff_deg(storm_mean, `pre-storm_mean`), NA_real_),
+    circ_diff_storm_post = if_else(is_direction, circular_diff_deg(`post-storm_mean`, storm_mean), NA_real_)
+  ) %>%
+  mutate(
+    # display columns
+    pre   = fmt_mean_sd_vec(`pre-storm_mean`, `pre-storm_sd`, digits),
+    storm = fmt_mean_sd_vec(storm_mean,       storm_sd,       digits),
+    post  = fmt_mean_sd_vec(`post-storm_mean`,`post-storm_sd`,digits),
+
+    # round numerics (stored)
+    delta_pre_storm  = round(delta_pre_storm, digits),
+    delta_storm_post = round(delta_storm_post, digits),
+    fold_pre_storm   = if_else(is.na(fold_pre_storm), NA_real_, round(fold_pre_storm, 2)),
+    fold_storm_post  = if_else(is.na(fold_storm_post), NA_real_, round(fold_storm_post, 2)),
+    circ_diff_pre_storm  = if_else(is.na(circ_diff_pre_storm), NA_real_, round(circ_diff_pre_storm, 0)),
+    circ_diff_storm_post = if_else(is.na(circ_diff_storm_post), NA_real_, round(circ_diff_storm_post, 0)),
+
+    # NEW: formatted (character) versions that *display* with correct decimals
+    delta_pre_storm_fmt  = fmt_num_vec(delta_pre_storm, digits),
+    delta_storm_post_fmt = fmt_num_vec(delta_storm_post, digits),
+    fold_pre_storm_fmt   = if_else(is.na(fold_pre_storm), NA_character_, sprintf("%.2f", fold_pre_storm)),
+    fold_storm_post_fmt  = if_else(is.na(fold_storm_post), NA_character_, sprintf("%.2f", fold_storm_post))
+  ) %>%
+  select(
+    variable,
+    pre, storm, post,
+    delta_pre_storm_fmt, fold_pre_storm_fmt,
+    delta_storm_post_fmt, fold_storm_post_fmt,
+    circ_diff_pre_storm, circ_diff_storm_post
+  )
+)
+
+# --- Save table ---
+write_csv(
+  all_stats_final,
+  file.path(output_path, "storm_env_continuous_summary.csv"),
+  na = ""
+)
+```
+
+# Tidal stage matching
+```{r}
+# ---------- 1) NOAA verified water-level reader ------------------------------
+# Copied verbatim from 01_tidal_dynamics.rmd, section 2a, so this chunk is
+# self-contained. If you ever update one, update both for consistency.
+parse_noaa_obs <- function(filepath) {
+  raw <- read_csv(filepath, show_col_types = FALSE)
+
+  message(sprintf("  %s — %d cols (%d rows): %s",
+                  basename(filepath), ncol(raw), nrow(raw),
+                  paste(names(raw), collapse = ", ")))
+
+  # Standardise column names via partial match
+  cnames <- tolower(names(raw))
+  date_col     <- names(raw)[str_detect(cnames, "^date")][1]
+  time_col     <- names(raw)[str_detect(cnames, "time")][1]
+  pred_col     <- names(raw)[str_detect(cnames, "predict")][1]
+  verified_col <- names(raw)[str_detect(cnames, "verif")][1]
+
+  raw %>%
+    rename(date_val   = !!date_col,
+           time_val   = !!time_col,
+           pred_m     = !!pred_col,
+           verified_m = !!verified_col) %>%
+    mutate(
+      date_clean = as.Date(date_val),
+      time_secs  = as.numeric(hms::as_hms(time_val)),
+      datetime   = as.POSIXct(as.numeric(as.POSIXct(date_clean,
+                                                    tz = "Pacific/Honolulu")) +
+                                time_secs,
+                              origin = "1970-01-01",
+                              tz = "Pacific/Honolulu"),
+      pred_m     = suppressWarnings(as.numeric(pred_m)),
+      verified_m = suppressWarnings(as.numeric(verified_m))
+    ) %>%
+    select(datetime, pred_m, verified_m) %>%
+    filter(!is.na(datetime), !is.na(verified_m))
+}
+
+# ---------- 2) Load and pool verified water levels ---------------------------
+noaa_obs <- bind_rows(
+  parse_noaa_obs(file.path(input_path_1, "tides/noaa_mokh1_tides_june.csv")),
+  parse_noaa_obs(file.path(input_path_1, "tides/noaa_mokh1_tides_july.csv")),
+  parse_noaa_obs(file.path(input_path_1, "tides/noaa_mokh1_tides_august.csv"))
+) %>%
+  arrange(datetime) %>%
+  distinct()
+
+stopifnot(nrow(noaa_obs) > 0)
+message(sprintf("NOAA verified: %d rows (%s to %s)",
+                nrow(noaa_obs),
+                format(min(noaa_obs$datetime), "%Y-%m-%d"),
+                format(max(noaa_obs$datetime), "%Y-%m-%d")))
+
+# ---------- 3) Tidal extrema detector ----------------------------------------
+# Copied verbatim from 01_tidal_dynamics.rmd, section 2b.
+EXTREMA_HALF_WINDOW_MIN <- 220L
+
+detect_extrema <- function(obs_df, half_window_min = EXTREMA_HALF_WINDOW_MIN) {
+  hw <- dminutes(half_window_min)
+
+  candidates <- obs_df %>%
+    mutate(
+      is_high = map_lgl(seq_len(n()), function(i) {
+        win <- obs_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        verified_m[i] == max(win$verified_m, na.rm = TRUE)
+      }),
+      is_low = map_lgl(seq_len(n()), function(i) {
+        win <- obs_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        verified_m[i] == min(win$verified_m, na.rm = TRUE)
+      })
+    ) %>%
+    filter(is_high | is_low) %>%
+    mutate(tide_type = case_when(
+      is_high & !is_low ~ "H",
+      is_low & !is_high ~ "L",
+      TRUE              ~ NA_character_
+    )) %>%
+    filter(!is.na(tide_type))
+
+  candidates %>%
+    arrange(datetime) %>%
+    mutate(type_run = cumsum(tide_type != lag(tide_type, default = ""))) %>%
+    group_by(type_run) %>%
+    slice(
+      if (first(tide_type) == "H") which.max(verified_m)
+      else which.min(verified_m)
+    ) %>%
+    ungroup() %>%
+    select(datetime, verified_m, pred_m, tide_type) %>%
+    arrange(datetime)
+}
+
+message("Detecting tidal extrema from verified water levels (this may take ~30 s)...")
+tides_noaa <- detect_extrema(noaa_obs)
+message(sprintf("Detected %d tidal extrema from verified signal",
+                nrow(tides_noaa)))
+
+# ---------- 4) Shape into tides_tbl for low_tide_change_ctd() ----------------
+tides_tbl <- tides_noaa %>%
+  transmute(
+    tide_datetime = datetime,
+    tide_date     = as.Date(datetime),
+    verified_m,
+    pred_m,
+    hilo          = tide_type
+  )
+
+# Sanity check: should see mostly (2, 2) for mixed semi-diurnal
+tides_tbl %>%
+  count(tide_date, hilo) %>%
+  pivot_wider(names_from = hilo, values_from = n, values_fill = 0) %>%
+  count(H, L)
+
+# ---------- 5) CTD reader ----------------------------------------------------
+# Unchanged from your original
+read_ctd <- function(ctd_csv_path, tz = "Pacific/Honolulu") {
+  df <- read_csv(ctd_csv_path, show_col_types = FALSE)
+  value_col <- setdiff(names(df), "datetime")
+  if (length(value_col) != 1) stop("CTD file must have 'datetime' + exactly one value column.")
+  df %>%
+    mutate(
+      dt_chr = str_squish(str_replace_all(as.character(datetime), "\u00A0", " ")),
+      datetime = suppressWarnings(parse_date_time(
+        dt_chr,
+        orders = c("mdy HMS p","mdy HM p","mdy HMS","mdy HM","ymd HMS","ymd HM"),
+        tz = tz
+      )),
+      value = suppressWarnings(as.numeric(.data[[value_col]]))
+    ) %>%
+    filter(!is.na(datetime), !is.na(value)) %>%
+    select(datetime, value)
+}
+
+# ---------- 6) Matched-low-tide function -------------------------------------
+# Changes from original:
+#   (a) slice_min on `verified_m` (was `pred_ft`)
+#   (b) storm_end default = 2014-07-23 (4-day standardized window: 20–23 Jul)
+low_tide_change_ctd <- function(ctd_variable_csv,
+                                ctd_pressure_csv,
+                                tides_tbl,
+                                tz = "Pacific/Honolulu",
+                                window_mins = 30,
+                                min_lag_mins = 40,
+                                max_lag_mins = 150,
+                                match = c("lower_low", "all_lows"),
+                                agg = c("mean", "min"),
+                                pre_start   = as.Date("2014-07-06"),
+                                pre_end     = as.Date("2014-07-19"),
+                                storm_start = as.Date("2014-07-20"),
+                                storm_end   = as.Date("2014-07-23"),
+                                variable_name = NULL,
+                                convert_to_cm = FALSE,
+                                cm_per_unit = 100) {
+
+  match <- match.arg(match)
+  agg   <- match.arg(agg)
+
+  low_noaa <- tides_tbl %>%
+    filter(hilo == "L") %>%
+    group_by(tide_date) %>%
+    { if (match == "lower_low") slice_min(., verified_m, n = 1, with_ties = FALSE) else . } %>%
+    ungroup() %>%
+    mutate(
+      phase = case_when(
+        tide_date >= pre_start   & tide_date <= pre_end   ~ "pre-storm",
+        tide_date >= storm_start & tide_date <= storm_end ~ "storm",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(phase))
+
+  p <- read_ctd(ctd_pressure_csv, tz = tz) %>% rename(pressure = value)
+
+  lagged <- low_noaa %>%
+    mutate(
+      search_start = tide_datetime + minutes(min_lag_mins),
+      search_end   = tide_datetime + minutes(max_lag_mins)
+    ) %>%
+    rowwise() %>%
+    mutate(
+      hfp_low_time = {
+        x <- p %>% filter(datetime >= search_start, datetime <= search_end)
+        if (nrow(x) == 0) as.POSIXct(NA) else {
+          xmin <- min(x$pressure, na.rm = TRUE)
+          min(x$datetime[x$pressure == xmin])
+        }
+      },
+      lag_minutes = as.numeric(difftime(hfp_low_time, tide_datetime, units = "mins"))
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(hfp_low_time))
+
+  v <- read_ctd(ctd_variable_csv, tz = tz)
+
+  if (is.null(variable_name)) {
+    variable_name <- basename(ctd_variable_csv) %>%
+      str_remove("\\.csv$") %>%
+      str_remove("^extracted_") %>%
+      str_remove("^ctd_extracted_")
+  }
+
+  matched <- lagged %>%
+    rowwise() %>%
+    mutate(
+      low_tide_value = {
+        t0 <- hfp_low_time
+        x <- v %>%
+          filter(datetime >= t0 - minutes(window_mins),
+                 datetime <= t0 + minutes(window_mins)) %>%
+          pull(value)
+        if (length(x) == 0) NA_real_
+        else if (agg == "mean") mean(x, na.rm = TRUE)
+        else min(x, na.rm = TRUE)
+      }
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(low_tide_value))
+
+  phase_means <- matched %>%
+    group_by(phase) %>%
+    summarize(
+      variable      = variable_name,
+      n_events      = n(),
+      mean_low_tide = mean(low_tide_value, na.rm = TRUE),
+      sd_low_tide   = if (n() < 2) NA_real_ else sd(low_tide_value, na.rm = TRUE),
+      mean_lag_mins = mean(lag_minutes, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  pre_mu   <- phase_means %>% filter(phase == "pre-storm") %>% pull(mean_low_tide)
+  storm_mu <- phase_means %>% filter(phase == "storm")     %>% pull(mean_low_tide)
+
+  list(
+    matched_events = matched,
+    phase_summary  = phase_means,
+    comparison = tibble(
+      variable                = variable_name,
+      window_mins             = window_mins,
+      lag_search_mins         = paste0(min_lag_mins, "–", max_lag_mins),
+      pre_mean_low_tide       = pre_mu,
+      storm_mean_low_tide     = storm_mu,
+      delta                   = storm_mu - pre_mu,
+      pct_higher_storm_vs_pre = (storm_mu / pre_mu - 1) * 100,
+      delta_converted         = if (convert_to_cm) (storm_mu - pre_mu) * cm_per_unit else NA_real_,
+      converted_units         = if (convert_to_cm) "cm" else NA_character_
+    )
+  )
+}
+
+# ---------- 7) RUN: pressure -------------------------------------------------
+lowtide_pressure <- low_tide_change_ctd(
+  ctd_variable_csv = file.path(input_path_2, "ctd_extracted_pressure.csv"),
+  ctd_pressure_csv = file.path(input_path_2, "ctd_extracted_pressure.csv"),
+  tides_tbl        = tides_tbl,
+  match            = "lower_low",
+  agg              = "mean",
+  variable_name    = "pressure",
+  convert_to_cm    = TRUE,
+  cm_per_unit      = 100
+)
+
+# ---------- 8) RUN: salinity -------------------------------------------------
+lowtide_salinity <- low_tide_change_ctd(
+  ctd_variable_csv = file.path(input_path_2, "ctd_extracted_salinity.csv"),
+  ctd_pressure_csv = file.path(input_path_2, "ctd_extracted_pressure.csv"),
+  tides_tbl        = tides_tbl,
+  match            = "lower_low",
+  agg              = "mean",
+  variable_name    = "salinity"
+)
+
+# Preview
+rbind(lowtide_pressure$comparison,  lowtide_salinity$comparison)
+rbind(lowtide_pressure$phase_summary, lowtide_salinity$phase_summary)
+```
+

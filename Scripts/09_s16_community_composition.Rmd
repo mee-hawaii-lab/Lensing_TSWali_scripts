@@ -1,0 +1,255 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(phyloseq)
+library(vegan)
+library(scales)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(writexl)
+library(microshades)
+
+# ---- File paths ----
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/s16_microbial/otu_tables")
+output_path  <- file.path(current_path, "../output/community_composition")
+```
+
+## 1. Load & tidy phyloseq data
+```{r}
+abund_m <- data.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_relabund_table.csv"), row.names = 1) # Count table
+  )
+tax_m <- as.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_tax_table.csv"),   row.names = 1) # Taxonomy table
+  )
+meta <- read.csv(file.path(input_path,"s16_asv_qc_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Create phyloseq object ----
+ps_rel <- phyloseq(
+  otu_table(abund_m, taxa_are_rows = T), 
+  tax_table(tax_m),
+  sample_data(meta))
+ps_rel
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+pchem  <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts   <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+
+# ---- Format levels ----
+ps_rel@sam_data$DM     <- factor(ps_rel@sam_data$DM, levels = dm)
+ps_rel@sam_data$Stage  <- factor(ps_rel@sam_data$Stage, levels = stage)
+ps_rel@sam_data$Stage2 <- factor(ps_rel@sam_data$Stage2, levels = stage2)
+ps_rel@sam_data$Site   <- factor(ps_rel@sam_data$Site, levels = site)
+ps_rel@sam_data$Region <- factor(ps_rel@sam_data$Region, levels = region)
+```
+
+## 2. Relative abundnce summary tables
+Calculates descriptive relative abundance metrics (mean and standard deviations) between sampling dates and storm stages.
+```{r}
+# Write tabulation function
+tab_rank <- function(rank) {
+  ps_glom <- tax_glom(ps_rel, taxrank = rank, NArm = TRUE) # Conglomerate
+  tt <- (as.data.frame(tax_table(ps_glom))) # save tax table
+  df <- psmelt(ps_glom) # Melt to data frame
+  
+  # Tabulate total
+  tab_all <- df %>%
+    dplyr::group_by(!!sym(rank)) %>%
+    dplyr::summarise(
+      Total_Sum = number((sum(Abundance)/sum(df$Abundance))*100,0.001), # Calculate sum percentage
+      .groups = "drop")
+  
+  # Tabulate by storm stage
+  tab_stage <- df %>%
+    dplyr::group_by(!!sym(rank), Stage) %>%
+    dplyr::summarise(
+      Mean = number(mean(Abundance * 100), 0.01), # Calculate mean
+      SD   = number(sd(Abundance * 100), 0.01), # Calculate sd
+      .groups = "drop") %>%
+  pivot_wider(
+    names_from  = Stage, 
+    values_from = c(Mean, SD),
+    names_glue  = "{Stage} {.value}") %>%
+  dplyr::select(1,2,5,3,6,4,7)   # Reorder 
+  
+  # Tabulate by date
+  tab_date <- df %>%
+    dplyr::group_by(!!sym(rank), DM) %>%
+    dplyr::summarise(
+      Mean = number(mean(Abundance * 100), 0.01), # Calculate mean
+      SD   = number(sd(Abundance * 100), 0.01), # Calculate sd
+      .groups = "drop") %>%
+  pivot_wider(
+    names_from  = DM, 
+    values_from = c(Mean, SD),
+    names_glue  = "{DM} {.value}") %>%
+  dplyr::select(1,2,7,3,8,4,9,5,10,6,11)   # Reorder 
+  
+  # Format output
+  combined <- list(tab_all, tab_stage, tab_date) %>% purrr::reduce(~ left_join(.x, .y, by = rank))
+  out <- tt %>% dplyr::select(where(~ !all(is.na(.x)))) %>% left_join(combined, by = rank)
+  colnames(out) <- gsub("[[:space:]\\.]", "_", colnames(out))
+  
+  # Export CSV file
+  filename <- paste0("s16_tax_summary_", which(colnames(tt) == rank), "_", rank, ".csv")  # Build file name
+  write.csv(out, file.path(output_path, filename), row.names = FALSE) # Save to CSV
+  return(out)
+}
+
+# Generate a named list of tab_rank() outputs
+tax_ranks = colnames(tax_table(ps_rel))
+tabs <- lapply(tax_ranks, function(r) tab_rank(rank = r))
+names(tabs) <- tax_ranks   # sheet names
+
+# Write all to Excel
+write_xlsx(tabs, path = file.path(output_path, "s16_tax_summary.xlsx"))
+```
+
+## Customized tabulations
+Calculates descriptive relative abundance metrics for specific groups with exclusions or additional grouping factors.
+```{r}
+# Write customized tabulation function
+tab_taxa <- function(filter, exclude, add_Grouping = NULL) {
+  tt <- as.data.frame(tax_table(ps_rel)) # save tax table
+  
+  # Detect which columns to filter on
+  filter_rank <- names(tt)[ sapply(tt, function(col) any(col %in% filter)) ]
+  if (is.null(exclude)) {
+    keep_taxa <- rownames(tt)[ tt[[filter_rank]] %in% filter ]
+  } else {
+    exclude_rank <- names(tt)[ sapply(tt, function(col) any(col %in% exclude)) ]
+    keep_taxa <- rownames(tt)[ tt[[filter_rank]] %in% filter & !(tt[[exclude_rank]] %in% exclude) ]
+  }
+  
+  # Prune
+  ps_filt <- prune_taxa(keep_taxa, ps_rel)
+  ps_filt_glom <- tax_glom(ps_filt, taxrank = filter_rank, NArm = TRUE)
+  df <- psmelt(ps_filt_glom)
+  
+  # Tabulate by storm stage
+  tab_stage <- df %>%
+    dplyr::group_by(!!sym(filter_rank), Stage, !!!if (!is.null(add_Grouping)) syms(add_Grouping) else NULL) %>%
+    dplyr::summarise(
+      Mean_perc = number(mean(Abundance * 100), 0.01), # Calculate mean
+      SD_perc   = number(sd(Abundance * 100), 0.01), # Calculate sd
+      Min_perc  = number(min(Abundance * 100), 0.01), # Calculate minimum
+      Max_perc  = number(max(Abundance * 100), 0.01), # Calculate maximum
+      .groups = "drop"
+    )  %>% dplyr::rename(Group = Stage)
+  
+  # Tabulate by date
+  tab_date <- df %>%
+    dplyr::group_by(!!sym(filter_rank), DM, !!!if (!is.null(add_Grouping)) syms(add_Grouping) else NULL) %>%
+    dplyr::summarise(
+      Mean_perc = number(mean(Abundance * 100), 0.01), # Calculate mean
+      SD_perc   = number(sd(Abundance * 100), 0.01), # Calculate sd
+      Min_perc  = number(min(Abundance * 100), 0.01), # Calculate minimum
+      Max_perc  = number(max(Abundance * 100), 0.01), # Calculate maximum
+      .groups = "drop"
+    ) %>% dplyr::rename(Group = DM)
+  
+  # Output
+  out <- rbind(tab_stage, tab_date)
+  return(out)
+}
+
+# Explore Archaea
+tab_taxa(filter = "Archaea", exclude = c()) # Calculate Archaea by date
+tab_taxa(filter = "Archaea", exclude = c(), add_Grouping = "Region") # Calculate Archaea by date AND region
+
+# Explore Alphaproteobacteria
+tab_taxa(filter = "Rhodobacteraceae", 
+         exclude = c("Gemmobacter", "Marivivens", "HIMB11"))
+
+# Explore Gammaproteobacteria
+tab_taxa(filter = "Halieaceae", 
+         exclude = c("OM60(NOR5) clade")) # Calculate Halieaceae without OM60(NOR5)
+
+# Explore Flavobacteriia
+tab_taxa(filter = "Flavobacteriaceae", 
+         exclude = c("Flavobacterium", 
+                     "NS4 marine group", 
+                     "NS5 marine group", 
+                     "NS9 marine group ge", 
+                     "NS11-12 marine group ge"))
+```
+
+
+## Stacked barplot
+```{r}
+mdf <- prep_mdf(ps_rel, subgroup_level = "Genus") # Prepare melted dataframe (mdf)
+
+# Create a color object
+color_ps <- create_color_dfs(mdf, group_level = "Phylum", 
+                             subgroup_level = "Genus", 
+                             cvd = TRUE,
+                             selected_groups = 
+                               c("Proteobacteria", "Bacteroidota", "Cyanobacteria", "Verrucomicrobiota")) 
+mdf_ps <- color_ps$mdf # Extract data
+mdf_ps$Sample <- mdf_ps$Site # Use shorter sample name
+cdf_ps <- color_ps$cdf # Extract data
+
+
+# Order sites by region
+site_order <- c("P3","P4","P7","P5",      # Kahawai
+                "P6","P2","P1","P10",      # Mauka
+                "P8","P9","OM2")           # Makai
+
+mdf_ps$Sample <- factor(as.character(mdf_ps$Sample), levels = site_order)
+
+# Custom legend
+leg <- custom_legend(
+  mdf_ps,
+  cdf_ps,
+  group_level = "Phylum",
+  subgroup_level = "Genus",
+  x = "Sample",
+  y = "Abundance",
+  legend_key_size = 0.25,
+  legend_text_size = 9,
+  legend_orientation = "vertical"
+)
+
+
+# Plot
+barplot <- plot_microshades(mdf_ps, cdf_ps, group_label = "Phylum Genus") + 
+  scale_y_continuous(labels = scales::percent, expand = expansion(0)) +
+  facet_grid(~ DM, scales = "free_x", space = "free_x") +
+  xlab("Site") + ylab("Relative Abundance") +
+  theme(axis.text.x = element_text(size= 6),
+        legend.position = "none",
+        strip.background = element_rect(fill = "white", color = NA),
+        panel.background  = element_rect(fill = "white", color = NA),
+        strip.text = element_text(color = "black", face = "bold")
+        )
+
+barplot$layers[[1]]$aes_params$colour    <- "grey90"
+barplot$layers[[1]]$aes_params$linewidth <- 0.05
+barplot$layers[[1]]$aes_params$width     <- 1
+(barplot <- ggarrange(barplot, leg, widths = c(4,1)))
+
+# Save to file
+ggsave(file.path(output_path,"s16_stacked_barplot.pdf"), barplot,
+        device = "pdf", width = 9, height = 4, units = "in", dpi = 600)
+```
+**Figure S4: Relative abundance of bacterioplankton communities in Heʻeia Fishpond before, during, and after Tropical Storm Wali.** Relative abundances were calculated from proportional 16S rRNA gene amplicon data. Stacked bars show the relative abundance of bacterial genera across all sampling sites for each sampling date. Samples are grouped by date (09 Jul, 16 Jul, 23 Jul, 30 Jul, and 06 Aug) and ordered by region within each panel. Colors correspond to genera nested within major bacterial phyla (Proteobacteria, Bacteroidota, Cyanobacteria, Verrucomicrobiota, and others). Genera with low abundance or unclassified assignments within each phylum were combined into “Other.”
+
+

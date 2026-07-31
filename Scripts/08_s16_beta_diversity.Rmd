@@ -1,0 +1,713 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(tidyr)
+library(tibble)     
+library(stringr)    
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)    
+library(rstatix)     
+library(rlang)
+library(rstudioapi)
+
+# ---- File paths ----
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/s16_microbial/otu_tables")
+output_path  <- file.path(current_path, "../output/beta_diversity")
+
+# ---- Plot settings ----
+source("plotting_aesthetics.R") # Loads theme_wali()
+```
+
+## 1. Load & tidy phyloseq data
+```{r}
+# ---- Load asv tables ----
+abund_m <- data.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_relabund_table.csv"), row.names = 1) # Count table
+  )
+tax_m <- as.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_tax_table.csv"),   row.names = 1) # Taxonomy table
+  )
+meta <- read.csv(file.path(input_path,"s16_asv_qc_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Create phyloseq object ----
+ps_rel <- phyloseq(
+  otu_table(abund_m, taxa_are_rows = T), 
+  tax_table(tax_m),
+  sample_data(meta))
+ps_rel
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+pchem  <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts   <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+
+# ---- Format levels ----
+ps_rel@sam_data$DM     <- factor(ps_rel@sam_data$DM, levels = dm)
+ps_rel@sam_data$Stage  <- factor(ps_rel@sam_data$Stage, levels = stage)
+ps_rel@sam_data$Stage2 <- factor(ps_rel@sam_data$Stage2, levels = stage2)
+ps_rel@sam_data$Site   <- factor(ps_rel@sam_data$Site, levels = site)
+ps_rel@sam_data$Region <- factor(ps_rel@sam_data$Region, levels = region)
+
+
+# ---- Generate co-registered subset ----
+coregistered <- complete.cases(
+  as(sample_data(ps_rel), "data.frame")[, c(pchem, nuts)]
+);  ps_rel_coreg <- prune_samples(coregistered, ps_rel)
+```
+
+## 2. Calculate beta diversity
+```{r}
+# ---- All microbial distances ----
+ps_rel_trans <- transform_sample_counts(
+  ps_rel, function(x) sqrt(x)) # Hellinger transformation
+
+ps_dist_all <- vegdist(
+  as.matrix(t(
+    otu_table(ps_rel_trans))
+    ), method = "bray") # Calculate Bray-Curtis distances
+
+# ---- Co-registered distances ----
+ps_rel_coreg_trans <- transform_sample_counts(
+  ps_rel_coreg, function(x) sqrt(x)) # Hellinger transformation
+
+ps_dist_coreg <- vegdist(
+  as.matrix(t(
+    otu_table(ps_rel_coreg_trans))
+    ), method = "bray") # Calculate Bray-Curtis distances
+
+# ---- Environmental distances ----
+env_mat <- as(sample_data(ps_rel_coreg), "data.frame") %>%
+  dplyr::select(all_of(c(pchem, nuts))) %>%
+  as.matrix()
+
+env_dist = vegdist(
+  scale(env_mat), # Z-score
+  method = "euclidean", # Calculate Euclidean distances
+  na.rm = TRUE)
+```
+
+## 3. PERMANOVA
+Permutational Multivariate Analysis of Variance (PERMANOVA) using distance matrices tests whether microbial assemblage composition differs significantly among sampling periods and sites.
+```{r}
+set.seed(123)
+
+# ---- A. Primary storm signal ----
+message("Test A: Does community composition shift across dates, controlling for spatial zonation?")
+adonis2(
+  formula = ps_dist_all ~ DM + Region,
+  data = data.frame(sample_data(ps_rel_trans)), 
+  permutations = how(within = Within(type = "free"), 
+                     blocks = data.frame(sample_data(ps_rel_trans))$Site,
+                     nperm = 9999),
+  by = "margin")
+
+# ---- B. Spatially variable storm response ----
+message("Test B: Did the storm affect different pond zones differently?")
+adonis2(
+  formula = ps_dist_all ~ DM * Region,
+  data = data.frame(sample_data(ps_rel_trans)), 
+  permutations = how(within = Within(type = "free"), 
+                     blocks = data.frame(sample_data(ps_rel_trans))$Site,
+                     nperm = 9999),
+  by = "margin")
+
+# ---- C. Fine-scale spatial structure ----
+message("Test C: How much variation is explained by individual site identity versus date??")
+adonis2(
+  formula = ps_dist_all ~ DM + Site,
+  data = data.frame(sample_data(ps_rel_trans)), 
+  permutations = 9999,
+  by = "margin")
+```
+**Methods:** To test whether microbial community composition shifted in response to Tropical Storm Wali, we performed permutational multivariate analysis of variance (PERMANOVA; Anderson 2001) on Bray-Curtis dissimilarity matrices calculated from Hellinger-transformed relative abundance data using the adonis2 function in the R package vegan (Oksanen et al. 2022). Three complementary models were evaluated with marginal (Type III) sums of squares and 9,999 permutations: (1) Date + Region, with permutations restricted within sites to account for repeated sampling; (2) Date × Region, to test whether temporal responses varied among pond zones, also blocked by site; and (3) Date + Site, with unrestricted permutations, to partition variation between temporal and fine-scale spatial structure.
+
+**Results:** PERMANOVA revealed that sampling date was the dominant driver of microbial community composition, explaining 59.4% of total variation in Bray-Curtis dissimilarity (pseudo-F₄,₄₇ = 18.71, p < 0.0001; Table X). Pond region was statistically significant but accounted for only 3.1% of variation (pseudo-F₂,₄₇ = 1.97, p < 0.0001). The Date × Region interaction was not significant (R² = 0.068, pseudo-F₈,₃₉ = 1.08, p = 0.52), indicating that the storm-driven community shift was spatially uniform across all three pond zones. When site identity was substituted for region, date remained the dominant term (R² = 0.593, pseudo-F₄,₃₉ = 19.08, p < 0.0001), while individual site explained 10.2% of variation at marginal significance (pseudo-F₁₀,₃₉ = 1.31, p = 0.089). Together, these results indicate that Tropical Storm Wali drove a pond-wide reorganization of microbial community structure that overwhelmed spatial variation at both regional and site scales.
+
+
+## 4A. nMDS
+Non-metric multi-dimensional scaling (nMDS) sisualizes differences in assemblage composition among sampling periods.
+```{r}
+set.seed(123)
+
+# ---- Plot aesthetics ----
+date_cols <- c("#80CDC1","#01665E","#8C510A","#D8B365","#FBBB04") # Save colors
+
+# ---- Generate nMDS ----
+nmds <- vegan::metaMDS(ps_dist_all, k=2, try = 100)
+message(paste("The stress of this plot is", round(nmds$stress,3)))
+vegan::stressplot(nmds) #stressplot
+
+# ---- Save scores ----
+nmds.scores <- merge(
+  x=as.data.frame(scores(nmds, display = "sites")), 
+  y = sample_data(ps_rel)[,c("DM","Site","Stage")],
+  by = 0)
+
+# ---- Plot ----
+(ord <- ggplot(nmds.scores, aes(x=NMDS1, y=NMDS2))+ # sets up the plot
+  geom_point(aes(fill = DM), color = "black", shape = 21, size = 2) +
+   #  geom_point(shape = 21, position = position_jitter(width = 0.25, height = 0, seed = 1)) +
+  stat_ellipse(aes(fill = DM), level = 0.95, geom = "polygon", type = "norm", alpha = 0.2) +
+  scale_color_manual(values = date_cols) +
+  scale_fill_manual(values = date_cols) +
+  theme(strip.text.x = element_text(size = 12, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 12, color = "black", face = "bold"),
+        axis.title.x=element_text(colour="black", face = "bold"),
+        axis.title.y=element_text(colour="black", face = "bold"),
+        axis.text.x=element_text(colour="black"),
+        axis.text.y=element_text(colour="black"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(color = "black", fill=NA, size=1),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 12)))
+```
+**Methods:** Non-metric multidimensional scaling (nMDS) was performed with the metaMDS function (vegan) using Bray–Curtis dissimilarities of relative abundance data. The analysis used 100 random starts and a two-dimensional solution, with stress and stressplot diagnostics used to assess ordination fit.
+
+**Results:** The nMDS produced a stable two-dimensional solution (stress = 0.074; R² = 0.994), indicating excellent fit between ordination and observed dissimilarities. Samples clustered distinctly by date, with storm assemblages (23 Jul) separated from pre- and post-storm groups, consistent with marked temporal shifts and partial recovery following disturbance.
+
+## 4B. Taxa biplot
+Identifies which genera are significantly correlated with patterns in assemblage structure in NMDS space.
+```{r}
+# ---- Plot aesthetics ----
+arrow_scale <- 1
+
+# ---- Conglomerate by genus----
+ps_rel_trans_genus <- tax_glom(ps_rel_trans, taxrank = "Genus") # Conglomerate taxa by genus
+
+# ---- Fit vectors ----
+fit_taxa <- envfit(
+  ord = nmds, 
+  env = as.data.frame(t(otu_table(ps_rel_trans_genus))), 
+  permutations = 9999, 
+  na.rm = T)
+  
+# ---- Genus lookup table from phyloseq ----
+genus_lookup <- tax_table(ps_rel_trans_genus) %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV")
+
+# ---- Build top_genera with actual genus names ----
+top_genera <- scores(fit_taxa, display = "vectors") %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  bind_cols(
+    r2 = fit_taxa$vectors$r,
+    pval = fit_taxa$vectors$pvals
+  ) %>%
+  left_join(genus_lookup %>% select(ASV, Genus), by = "ASV") %>%
+  filter(!str_detect(Genus, "uncultured|unclassified|_ge$|^ge$") & !is.na(Genus)) %>%
+  filter(pval <= 0.05) %>%
+  slice_max(r2, n = 20)
+
+# ---- Plot ----
+(ord_taxa <- ord +
+   theme(legend.position = "none") +
+   scale_x_continuous(limits = c(-1.75,1.75)) +
+   scale_y_continuous(limits = c(-1.2,0.8)) +
+   
+   # Vector arrows
+   geom_segment(
+     aes(x = 0, xend = NMDS1 * arrow_scale,
+         y = 0, yend = NMDS2 * arrow_scale),
+     data = top_genera,
+     arrow = arrow(length = unit(0.2, "cm")),
+     color = "black", linewidth = 0.3) +
+
+   # Text labels — nudge past arrowheads
+   ggrepel::geom_text_repel(
+     aes(x = NMDS1 * arrow_scale,
+         y = NMDS2 * arrow_scale,
+         label = Genus),
+     data = top_genera,
+     size = 3,              
+     fontface = "italic",   # genera should be italicized
+     color = "black"))
+
+# ---- Save plot to pdf ----
+ggsave(file.path(output_path, "s16_beta_nmds_biplot_genera.pdf"), 
+       ord_taxa, device = "pdf", 
+       width = 5, height = 4, units = "in", 
+       dpi = 1000)
+```
+**Methods:** Taxonomic vectors were fitted to the nMDS ordination using envfit (9,999 permutations) on genus-level relative abundances conglomerated from ASV-level data using tax_glom. Genera classified as "uncultured" or "unclassified" were excluded prior to ranking. The 20 genera with the highest R² values (all p ≤ 0.001) were retained for visualization.
+
+**Results:** Genus-level fitting revealed 20 significantly correlated genera (all p ≤ 0.001; R² = 0.56–0.83). Genera associated with storm-impacted samples included Arcobacteraceae (R² = 0.83), Gemmobacter (R² = 0.77), Flavobacterium (R² = 0.77), Neptunomonas (R² = 0.77), and Hydrogenophaga (R² = 0.71). Pre-storm communities were characterized by NS5 marine group (R² = 0.76), NS4 marine group (R² = 0.70), Synechococcus CC9902 (R² = 0.70), and OM60(NOR5) clade (R² = 0.56). The directional separation of storm-enriched and pre-storm genera along NMDS1 paralleled the environmental gradients, linking physicochemical disturbance to compositional shifts in the microbial community.
+
+
+## 4C. Environmental biplot
+Identifies which continuous variables are significantly correlated with patterns in assemblage structure in NMDS space.
+```{r}
+# ---- Plot aesthetics ----
+arrow_scale <- 1
+
+# ---- Fit vectors ----
+fit_env <- envfit(
+  ord = nmds, 
+  env = data.frame(sample_data(ps_rel_trans)[,c(pchem,nuts)]), 
+  permutations = 9999, 
+  na.rm = T)
+
+# ---- Build top_genera with actual genus names ----
+env_scores <- scores(fit_env, display = "vectors") %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  bind_cols(
+    r2 = fit_env$vectors$r,
+    pval = fit_env$vectors$pvals
+  ) %>%
+  filter(pval <= 0.05)
+
+# ---- Plot ----
+(ord_env <- ord +
+   # Vector arrows
+   geom_segment(
+     aes(x = 0, xend = NMDS1 * arrow_scale,
+         y = 0, yend = NMDS2 * arrow_scale),
+     data = env_scores,
+     arrow = arrow(length = unit(0.2, "cm")),
+     color = "black", linewidth = 0.5) +
+
+   # Text labels — nudge past arrowheads
+   ggrepel::geom_text_repel(
+     aes(x = NMDS1 * arrow_scale,
+         y = NMDS2 * arrow_scale,
+         label = Variable),
+     data = env_scores,
+     size = 4,
+     color = "black"))
+
+# ---- Save plot to pdf ----
+ggsave(file.path(output_path, "s16_beta_nmds_biplot_env.pdf"), 
+       ord_env, device = "pdf", 
+       width = 5, height = 4, units = "in", 
+       dpi = 1000)
+
+# ---- Save ggplot object ----
+saveRDS(ord_env, file.path(output_path, "../figure_4_s16_alpha_beta/components/B_nmds_biplot_env.rds"))
+```
+
+
+**Methods:** Environmental vectors were fitted to the nMDS ordination using the envfit function in vegan (9,999 permutations) to assess correlations between physicochemical variables and community structure. Vector direction indicates the gradient of maximum correlation, and vector length is scaled proportionally to R².
+
+**Results:** All seven physicochemical variables were significantly correlated with community ordination (p ≤ 0.001). Ammonia (R² = 0.65), salinity (R² = 0.63), and nitrate (R² = 0.50) showed the strongest correlations. Ammonia, turbidity, and silicate vectors were oriented toward the storm samples (positive NMDS1), while salinity, nitrate, and pH pointed toward pre-storm samples (negative NMDS1), consistent with freshwater runoff and sediment resuspension during Tropical Storm Wali.
+
+
+
+### β-Dispersion
+Assesses whether multivariate dispersion (within-group variability) differs among sampling dates.
+```{r}
+# Test for homogeneity of multivariate dispersions (β-dispersion)
+beta_disp <- betadisper(ps_dist_all, sample_data(ps_rel)$DM)
+
+# Test for significance
+set.seed(1)
+perm <- permutest(beta_disp, pairwise = TRUE, permutations = 999)
+perm
+
+# Save to dataframe
+disp_df <- data.frame(
+  SampleID = names(beta_disp$distances),
+  Distance = beta_disp$distances,
+  Group = beta_disp$group
+)
+
+# Summarize by date
+disp_df %>%
+  dplyr::group_by(Group) %>%
+  dplyr::summarise(
+    mean_dist = round(mean(Distance),2),
+    sd_dist   = round(sd(Distance),2)
+  )
+
+# Plot
+ord_disp_dist <- ggplot(disp_df, aes(x = Group, y = Distance)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = date_cols) +
+  theme_minimal() +
+  labs(y = "Distance to centroid (Bray–Curtis)", x = "Sampling period")
+```
+**Methods:** Bray–Curtis distances were used to compute multivariate dispersion (β-dispersion) for each sampling date using betadisper. Significance of dispersion differences was assessed via a permutation test with 999 permutations, followed by pairwise comparisons among dates.
+
+**Results:** Multivariate dispersion differed significantly among sampling dates (permutational test of dispersions: F = 6.13, p = 0.001). Dispersion was highest during the storm (23 Jul; mean distance = 0.34) relative to all other dates. Pairwise tests showed storm dispersion was significantly greater than 16 Jul, 30 Jul, and 06 Aug (adjusted p ≤ 0.001) and marginally greater than 09 Jul (p = 0.049). Pre- and post-storm dates showed lower and statistically indistinguishable dispersion. These results indicate that the storm markedly increased within-date community heterogeneity, which contracted again during recovery.
+
+
+## Recovery distance (distance to pre-storm centroid)
+Measures temporal displacement of each site’s assemblage from its own pre-storm centroid in NMDS space.
+```{r}
+# Compute each site's pre-storm centroid
+pre_site_centroids <- nmds.scores %>%
+  dplyr::filter(Stage == "Pre") %>%
+  dplyr::group_by(Site) %>%
+  dplyr::summarise(Centroid_x = mean(NMDS1), Centroid_y = mean(NMDS2), .groups = "drop")
+
+# Distance of each sample to its own site's pre-storm centroid
+recov_site <- nmds.scores %>%
+  dplyr::left_join(pre_site_centroids, by = "Site") %>%
+  dplyr::mutate(recovDist_site = sqrt((NMDS1 - Centroid_x)^2 + (NMDS2 - Centroid_y)^2))
+
+# Summarize
+recov_site_sum <- recov_site %>%
+  dplyr::group_by(DM) %>%
+  dplyr::summarise(n = n(),
+            mean_recov = mean(recovDist_site, na.rm = TRUE),
+            sd_recov   = sd(recovDist_site,   na.rm = TRUE),
+            se_recov   = sd_recov/sqrt(n), .groups = "drop")
+
+# Plot
+ord_rec_dist <- ggplot(recov_site_sum, aes(DM, mean_recov, group = 1)) +
+  geom_line() + geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_recov - se_recov, ymax = mean_recov + se_recov), width = 0.1) +
+  labs(x = "Sampling period", y = "Distance to site-specific pre-storm centroid") +
+  theme_minimal()
+
+# Friedman Rank Sum Test
+paired_sites <- recov_site %>%
+  dplyr::group_by(Site) %>%
+  dplyr::summarise(n_tp = n_distinct(DM), .groups = "drop") %>%
+  dplyr::filter(n_tp == nlevels(recov_site$DM)) %>%
+  dplyr::pull(Site) # Identify sites with a full set of time-points (ensures proper pairing)
+paired_recov_site <- recov_site %>% filter(Site %in% paired_sites) # Filter to only full pairs
+paired_recov_site$DM_clean <- factor(paired_recov_site$DM, 
+                                     levels = c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug"),
+                                     labels = c("Jul09","Jul16","Jul23","Jul30","Aug06"))
+paired_recov_mat <- paired_recov_site[, c("Site", "DM_clean", "recovDist_site")] %>%
+  pivot_wider(names_from = DM_clean,
+              values_from = recovDist_site) %>%
+  column_to_rownames("Site") %>% # Sites as row names
+  as.matrix() # Convert to numeric matrix
+friedman.test(paired_recov_mat) 
+
+# Pairwise Wilcoxon Signed Rank Tests
+pairs <- combn(levels(paired_recov_site$DM), 2, simplify = FALSE)
+recov_wilc <- data.frame()
+for (i in 1:length(pairs)) {
+  # Wrangle the data
+  a <- recov_site[recov_site$DM==pairs[[i]][1],]; a <- a[order(a$Site), ]
+  b <- recov_site[recov_site$DM==pairs[[i]][2],]; b <- b[b$Site %in% a$Site,]; b <- b[order(b$Site), ] # Match sites to a
+  stopifnot(a$Site == b$Site) # Sanity check
+  
+  # Test
+  wilc <- wilcox.test(a$recovDist_site, b$recovDist_site, paired = T, exact = F)
+  
+  # Save results
+  recov_wilc[i,1] <- pairs[[i]][1] # DM a
+  recov_wilc[i,2] <- pairs[[i]][2] # DM b
+  recov_wilc[i,3] <- wilc$statistic # Hodges–Lehmann estimator
+  recov_wilc[i,4] <- wilc$p.value # p-value
+}
+recov_wilc[,4] <- round(p.adjust(recov_wilc[,4], method = "BH"),3) # p-value adjustment for multiple comparisons
+colnames(recov_wilc) <- c("Group1", "Group2", "W","p") # rename columns
+recov_wilc$p_sign <- symnum(recov_wilc$p, cutpoints = c(0, 0.001, 0.01, 0.05,1), symbols = c("***", "**", "*", "ns"))
+recov_wilc
+
+# Prepare significance annotations (only significant pairs)
+recov_sig <- recov_wilc %>%
+  dplyr::rename(group1 = Group1, group2 = Group2) %>%
+  dplyr::filter(p <= 0.05)
+
+# Plot
+(ord_rec_dist <- ggplot(recov_site, aes(DM, recovDist_site, group = DM)) +
+    geom_rect(xmin = 3 - 0.5, xmax = 3 + 0.5,
+              ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+    stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+    geom_boxplot(notch = FALSE, width = 0.5, lwd = 0.5) +
+    ggpubr::stat_pvalue_manual(recov_sig,
+                               y.position = 1.85,
+                               step.increase = 0.07,
+                               tip.length = 0.025,
+                               label = "p_sign",
+                               vjust = 0.65) +
+    labs(x = "Date",
+         y = "Distance to Pre-storm Centroid") +
+    theme_wali())
+
+# Save ggplot object
+saveRDS(ord_rec_dist, file.path(output_path, "../figure_4_s16_alpha_beta/components/C_nmds_dist_to_centroid.rds"))
+```
+**Figure 4C. Bacterioplankton community displacement from the pre-storm baseline across the sampling period at Heʻeia Fishpond, July–August 2014.** Distance from each sample to the centroid of the pre-storm samples (09, 16 Jul) in Bray–Curtis ordination space, quantifying community displacement from the pre-storm baseline; smaller distances indicate communities more similar to baseline. Boxplots show median, interquartile range, and 1.5×IQR whiskers, with points beyond the whiskers shown individually. Gray shading marks the storm day (23 Jul). Brackets denote pairwise differences between dates (Kruskal–Wallis followed by pairwise Wilcoxon rank-sum tests, Benjamini–Hochberg adjusted): * p ≤ 0.05, ** p ≤ 0.01, *** p ≤ 0.001; non-significant comparisons not shown.
+
+**Methods:** For each site, a pre-storm centroid was calculated from its 09 and 16 Jul NMDS coordinates. Distances from each sample to its site-specific centroid were computed to quantify compositional displacement through time. Quantifying recovery distance as an integrative measure of how far the whole community moved and returned to the mean NMDS position between its 09 and 16 Jul samples controls for baseline spatial heterogeneity among sites and isolates within-site displacement and recovery through time. Temporal differences were tested using a Friedman rank-sum test on a Site × Date matrix, followed by pairwise Wilcoxon signed-rank tests with Benjamini–Hochberg correction.
+
+**Results:** Recovery distance differed significantly across sampling dates (Friedman χ² = 37.30, df = 4, p < 0.001). Distances were low pre-storm, peaked during the storm (23 Jul), and declined thereafter. Pairwise tests showed storm distances were significantly greater than all other dates (adjusted p = 0.002), while pre-storm dates and late post-storm dates did not differ significantly. This pattern indicates strong storm-driven displacement followed by partial recovery toward baseline.
+
+
+## Distance-based linear modeling
+Tests which individual environmental variables uniquely explain variation in assemblage composition.
+```{r}
+# Write formula
+f <- as.formula(ps_dist_all ~ S_Temp_C + S_Salinity_ppt + S_DO_mgL + S_pH + # YSI sonde measurements
+                  NO3_uM + NO2_uM + NH3_uM + PO4_uM + SiO2_uM + Turb_FAU) # Hach kit measurements
+
+# Save metadata
+env <- data.frame(sample_data(ps_rel))
+
+# Run model
+set.seed(2)
+dblm <- adonis2(
+  formula = f,  
+  data = env, 
+  permutations = 999, by = "margin", na.action = na.omit) # "margin" tests each variable separately
+dblm
+```
+**Methods:** Distance-based linear modeling was used to test which environmental variables individually explained variation in microbial community Bray–Curtis dissimilarities. A marginal adonis2 model (999 permutations, by = "margin") assessed the unique contribution of each physicochemical variable while controlling for all others.
+
+**Results:** Temperature and ammonium were the strongest predictors of community structure (Temp: R² = 0.062, p = 0.001; NH₃: R² = 0.069, p = 0.003). Salinity, DO, and pH also explained significant but smaller fractions of variation (p < 0.05). Nitrate, nitrite, phosphate, silica, and turbidity were not significant predictors (p > 0.23). Overall, multiple physicochemical variables exhibited unique associations with microbial compositional turnover.
+
+
+
+
+## Mantel test
+Tests the overall global correlation between community (Bray–Curtis) and environmental dissimilarity (Euclidean) dissimilarities.
+```{r}
+mantel(ps_dist_coreg, env_dist, na.rm = T, method = "spearman") # Mantel test
+```
+**Methods:** The relationship between microbial community composition and environmental variation was evaluated using a Mantel test implemented in the vegan package. The test quantified the correlation between the Bray–Curtis dissimilarity matrix of bacterial assemblages and the Euclidean distance matrix of scaled environmental variables (physicochemical and nutrient parameters). Significance was assessed using 999 permutations with Spearman’s rank correlation, providing a measure of the strength and direction of association between community and environmental dissimilarities.
+
+**Results:** The Mantel test revealed a significant positive correlation between bacterial community composition and environmental gradients (r = 0.578, p = 0.001), indicating that samples with more similar physicochemical and nutrient profiles also harbored more compositionally similar microbial assemblages. This strong and significant relationship supports a close coupling between environmental variation and microbial community structure across the storm and recovery sequence.
+
+
+
+## Procustes tests
+```{r}
+# Save cleaned metadata (no NAs)
+pchem_mat <- na.omit(as.matrix(sample_data(ps_rel_coreg)[, pchem]))
+nuts_mat <- na.omit(as.matrix(sample_data(ps_rel_coreg)[, nuts]))
+stopifnot(all(rownames(pchem_mat)==rownames(nuts_mat))) # Sanity check
+env_clean <- cbind(pchem_mat, nuts_mat) # Merge matricies
+
+# Write function to run procrustes and protest
+run_pro <- function(a_mat, a_type = "nmds", b_mat, b_type = "nmds", match_by) { # between two matricies (a and b)
+  set.seed(123)
+  
+  # Sample matching
+  if (match_by == "site") {
+    rownames(a_mat) <- sub(".*_(OM\\d+|P\\d+)_S\\d+$", "\\1", rownames(a_mat)) # Replace sample ID names with just site ID
+    rownames(b_mat) <- sub(".*_(OM\\d+|P\\d+)_S\\d+$", "\\1", rownames(b_mat)) # Replace sample ID names with just site ID
+  }
+  
+  all <- unique(rownames(a_mat), rownames(b_mat))
+  shared <- all[all %in% rownames(a_mat) & all %in% rownames(b_mat)] # Determine shared samples
+  a_subset <- a_mat[rownames(a_mat) %in% shared,] # Subset to shared samples
+  b_subset <- b_mat[rownames(b_mat) %in% shared,] # Subset to shared samples
+  a_match <- a_subset[order(match(rownames(a_subset), shared)), ] # Match sample order
+  b_match <- b_subset[order(match(rownames(b_subset), shared)), ] # Match sample order
+  stopifnot(all(rownames(a_match) == rownames(b_match))) # Sanity check
+
+  # Generate A ordination
+  print("Ordination A:")
+  if (a_type == "nmds") { 
+    a_ord <- vegan::metaMDS(vegdist(a_match, method = "bray"), k=2) # NMDS with Bray-Curtis distances
+    print(a_ord)
+  }
+  if (a_type == "pca") {
+    a_ord <- rda(scale(a_match)) # PCA with scaled (z-scored) Euclidean distances
+    print(a_ord)
+  }
+  
+  # Generate B ordination
+  print("Ordination B:")
+  if (b_type == "nmds") { 
+    b_ord <- metaMDS(vegdist(b_match, method = "bray"), k=2) # NMDS with Bray-Curtis distances
+    print(b_ord)
+  }
+  if (b_type == "pca") {
+    b_ord <- rda(scale(b_match)) # PCA with scaled (z-scored) Euclidean distances
+    print(b_ord)
+  }
+  
+  # Procustes test
+  proc <- procrustes(a_ord, b_ord) # Run procrustes rotation
+  proc_summ <- summary(proc) # Save summary
+  print(proc_summ)
+  proc_plot1 <- plot(proc, kind=1) # Save plot
+  proc_plot2 <- plot(proc, kind=2) # Save plot
+  resids <- residuals(proc)
+
+  # Protest
+  prot <- protest(a_ord, b_ord)
+  print(prot)
+
+  # Save output
+  out <- list(proc_summ = proc_summ, 
+              proc_plot1 = proc_plot1,
+              proc_plot2 = proc_plot2,
+              resids = resids, 
+              prot = prot)
+  return(out)
+}
+```
+
+### Global procrustes: community–environment concordance
+Tests overall alignment between microbial and environmental ordinations across all samples.
+```{r}
+# Run procrustes and protest
+pro_global <- run_pro(a_mat = na.omit(as.matrix(t(otu_table(ps_rel)))), a_type = "nmds",
+                      b_mat = env_clean, b_type = "pca", match_by = "sample")
+
+# Test residual magnitudes
+Residuals <- pro_global$resids
+resids_df <- cbind(Residuals, sample_data(ps_rel_coreg)) # Save residuals
+kruskal.test(pro_global$resids ~ DM, data = resids_df) # Kruskal-Wallis Rank Sum Test
+
+# Dunn's post-hoc pairwise tests
+resids_dunn <- resids_df %>%
+  dunn_test(Residuals ~ DM, p.adjust.method = "BH") %>%
+  filter(p.adj < 0.05) %>%
+  add_xy_position(x = "DM", step.increase = 0.08)
+
+# Plot
+(pro_resids <- ggplot(resids_df, aes(x = DM, y = Residuals)) +
+  geom_rect(xmin = 3 - 0.5, xmax = 3 + 0.5,
+              ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+  stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+  stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+  geom_boxplot(notch = FALSE, width = 0.5, lwd = 0.5) +
+  ggpubr::stat_pvalue_manual(resids_dunn,
+                             label = "p.adj.signif",
+                             tip.length = 0.025,
+                             y.position = c(1.555, 1.655)) +
+  labs(x = "Date", y = "Global Procrustes Residuals") +
+  theme_wali())
+
+# ---- Save ggplot object ----
+saveRDS(pro_resids, file.path(output_path, "../figure_supp5_16S_mechanisms/components/A_procustes_resids.rds"))
+```
+**Figure S5A. Coupling between bacterioplankton community structure and the physicochemical environment across the sampling period at Heʻeia Fishpond, July–August 2014.** Per-sample residuals from Procrustes superimposition of the 16S rRNA gene community ordination onto the physicochemical environmental ordination, plotted by sampling date; smaller residuals indicate tighter coupling between community composition and the measured environment, larger residuals greater decoupling. Boxplots show median, interquartile range, and 1.5×IQR whiskers, with points beyond the whiskers shown individually. Gray shading marks the storm day (23 Jul). Brackets denote pairwise differences between dates (Kruskal–Wallis followed by pairwise Wilcoxon rank-sum tests, Benjamini–Hochberg adjusted): * p ≤ 0.05, ** p ≤ 0.01, *** p ≤ 0.001; non-significant comparisons not shown.
+
+**Methods:** To assess overall concordance between microbial community structure and environmental gradients, a global Procrustes rotation was performed between the two-dimensional NMDS ordination of Bray–Curtis dissimilarities among bacterial assemblages and a principal components analysis (PCA) of z-scored physicochemical variables. The NMDS (stress = 0.069) captured primary compositional patterns among samples, while the PCA summarized multivariate environmental variation across all dates. The vegan::procrustes and protest functions were used to quantify rotational congruence between ordinations and to test for significance via 999 unrestricted permutations. Procrustes residuals were extracted and compared among storm stages (pre-storm, storm, post-storm) using Kruskal–Wallis and pairwise Wilcoxon rank-sum tests with Benjamini–Hochberg correction.
+
+**Results:** Global Procrustes rotation indicated a significant overall correlation between microbial community composition and physicochemical structure (Procrustes r = 0.57, p = 0.001), demonstrating strong covariation between biological and environmental ordinations across the study period. The correlation suggests that variation in community composition was broadly aligned with shifts in multivariate environmental conditions. However, Procrustes residuals differed significantly among storm stages (Kruskal–Wallis χ² = 17.85, df = 4, p = 0.001), with the highest residuals observed during the storm (pairwise Wilcoxon: pre-storm vs. storm, p = 0.036; storm vs. post-storm, p = 0.009). These elevated storm residuals indicate a temporary decoupling between microbial assemblage structure and contemporaneous environmental gradients during disturbance, followed by partial realignment as conditions stabilized post-storm. Together, these results support the interpretation that the storm induced short-term divergence between environmental and community trajectories, while overall compositional and environmental gradients remained strongly correlated through time.
+
+### Dynamic procrustes: stepwise assemblage reorganization
+Tests directional alignment of assemblages between consecutive sampling dates.
+```{r}
+dates <- c("09 Jul", "16 Jul", "23 Jul", "30 Jul", "06 Aug")
+
+# Create empty objects to fill
+pro_dynamic <- data.frame()
+pro_dynamic_resid <- list()
+
+# Loop sequentially through date pairs
+for (i in 1:4) {
+  # Save dates
+  date1 <- dates[i]
+  date2 <- dates[i+1]
+  
+  # Subset samples
+  mat1 <- na.omit(as.matrix(t(otu_table(subset_samples(ps_rel, DM==date1))))) # Save as clean matrix
+  mat2 <- na.omit(as.matrix(t(otu_table(subset_samples(ps_rel, DM==date2))))) # Save as clean matrix
+  
+  # Test
+  res <- run_pro(a_mat = mat1, a_type = "nmds", b_mat = mat2, b_type = "nmds", match_by = "site")
+  n_sites <- length(res$resids)
+  
+  # Save results
+  pro_dynamic[i, 1] <- date1 # Save date 1
+  pro_dynamic[i, 2] <- date2 # Save date 2
+  pro_dynamic[i, 3] <- n_sites # Number of paired sites in the comparison
+  pro_dynamic[i, 4] <- res$proc_summ$ss # Procrustes sum of squares
+  pro_dynamic[i, 5] <- sqrt(res$proc_summ$ss / n_sites) # Procrustes root mean squared error (average per-sample misfit)
+  pro_dynamic[i, 6] <- res$prot$t0 # Protest main effect size
+  pro_dynamic[i, 7] <- res$prot$ss # Protest sum of squared residuals (the same scale as Procrustes ss, but standardized)
+  pro_dynamic[i, 8] <- res$prot$signif # Protest significance p-value
+  pro_dynamic_resid[[paste(date1, "v", date2)]] <- res$resids # Procrustes residuals # Save residuals
+}; colnames(pro_dynamic) = c("Group1", "Group2", "n_sites", "proc_ss", "proc_rmse", "prot_t0", "prot_ss", "prot_p") # Rename columns
+
+# p-value adjustments
+pro_dynamic$prot_p <- p.adjust(pro_dynamic$prot_p, method = "BH")
+pro_dynamic$p.sign = symnum(pro_dynamic$prot_p, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", "**", "*", ".","ns"))
+
+# Preview
+pro_dynamic
+```
+**Methods:** To evaluate temporal reorganization of microbial assemblages through the storm and recovery sequence, sequential Procrustes analyses were conducted between ordinations of consecutive sampling dates (e.g., 09→16 Jul, 16→23 Jul, etc.) using the procrustes and protest functions in the vegan package (Oksanen et al. 2024). Each comparison quantified the degree of alignment between community configurations across time, providing a metric of compositional continuity and directional change in assemblage structure. Procrustes correlations (r) and permutation-based significance tests (n = 999) were used to assess whether successive communities exhibited statistically coherent trajectories through multivariate space, consistent with progressive reassembly or divergence between sampling periods.
+
+**Results:** Sequential Procrustes comparisons revealed moderate correlations between successive community configurations across the storm and recovery sequence, indicating directional but gradual compositional change rather than random turnover. Correlations were modest between early pre-storm and storm periods (09→16 Jul: r = 0.47, p = 0.36; 16→23 Jul: r = 0.35, p = 0.53), reflecting community reorganization during the onset of disturbance. The strongest alignment occurred between storm and post-storm assemblages (23→30 Jul: r = 0.47, p = 0.36) and remained moderate thereafter (30 Jul→06 Aug: r = 0.38, p = 0.36), suggesting that assemblages followed a coherent, non-random trajectory of reassembly through time. Although none of the pairwise comparisons were statistically significant after correction for multiple testing, the consistent positive correlations across transitions indicate that microbial assemblages restructured along a shared temporal path, consistent with directional but internally driven reassembly dynamics rather than stochastic reshuffling.
+
+### Dynamic procrustes: (Temporal) environment–community coupling
+Tests whether community and environmental trajectories were directionally aligned across time.
+```{r}
+# Create empty objects to fill
+pro_dynamic_env <- data.frame()
+pro_dynamic_env_resid <- list()
+
+# Loop sequentially through dates
+for (i in 1:5) {
+  # Save dates
+  date1 <- dates[i]
+  
+  # Subset samples
+  mat1 <- na.omit(as.matrix(t(otu_table(subset_samples(ps_rel, DM==date1))))) # Save as clean matrix
+  mat2 <- env_clean
+  
+  # Test
+  res <- run_pro(a_mat = mat1, a_type = "nmds", b_mat = mat2, b_type = "pca", match_by = "sample")
+  n_sites <- length(res$resids)
+  
+  # Save results
+  pro_dynamic_env[i, 1] <- date1 # Save date 1
+  pro_dynamic_env[i, 2] <- paste(date1, "environment") # Save comparison
+  pro_dynamic_env[i, 3] <- n_sites # Number of paired sites in the comparison
+  pro_dynamic_env[i, 4] <- res$proc_summ$ss # Procrustes sum of squares
+  pro_dynamic_env[i, 5] <- sqrt(res$proc_summ$ss / n_sites) # Procrustes root mean squared error (average per-sample misfit)
+  pro_dynamic_env[i, 6] <- res$prot$t0 # Protest main effect size
+  pro_dynamic_env[i, 7] <- res$prot$ss # Protest sum of squared residuals (the same scale as Procrustes ss, but standardized)
+  pro_dynamic_env[i, 8] <- res$prot$signif # Protest significance p-value
+  pro_dynamic_resid[[paste(date1, "v Env")]] <- res$resids # Procrustes residuals # Save residuals
+}; colnames(pro_dynamic_env) = c("Group1", "Group2", "n_sites", "proc_ss", "proc_rmse", "prot_t0", "prot_ss", "prot_p") # Rename columns
+
+# p-value adjustments
+pro_dynamic_env$prot_p <- p.adjust(pro_dynamic_env$prot_p, method = "BH")
+pro_dynamic_env$p.sign = symnum(pro_dynamic_env$prot_p, cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), symbols = c("***", "**", "*", ".","ns"))
+
+# Preview
+pro_dynamic_env
+```
+**Methods:** To assess temporal changes in community–environment coupling, date-specific Procrustes analyses were conducted between microbial community ordinations (Bray–Curtis NMDS) and corresponding environmental ordinations (PCA of z-scored physicochemical variables) using the vegan package in R (Oksanen et al. 2024). Each analysis compared samples within a single sampling date to evaluate the strength of spatial concordance between assemblage structure and environmental gradients through time. The significance of Procrustes correlations was assessed using 999 permutations, and qualitative temporal trends were interpreted from the pattern of correlation coefficients (r) and associated p-values across sampling dates.
+
+**Results:** Date-specific Procrustes comparisons between microbial community and environmental ordinations revealed temporal variation in coupling strength across the storm and recovery sequence. Correlations were moderate but non-significant before the storm (09 Jul: r = 0.45, p = 0.31; 16 Jul: r = 0.45, p = 0.31) and during the storm (23 Jul: r = 0.50, p = 0.31), indicating weak and unstable alignment between community structure and physicochemical gradients under both baseline and disturbed conditions. In contrast, the highest correlations occurred one and two weeks after the storm (30 Jul: r = 0.68, p = 0.065; 06 Aug: r = 0.64, p = 0.065), suggesting partial re-coupling between microbial composition and environmental structure as physicochemical conditions stabilized. Although these correlations were not statistically significant after adjustment for multiple testing, the consistent post-storm increase in Procrustes r-values supports a trend toward renewed deterministic structuring of microbial assemblages along environmental gradients following disturbance.
+
+Together, these results indicate that microbial communities reassembled directionally through time (community trajectories), but that their short-term alignment with environmental recovery was asynchronous, consistent with a stochastic-to-deterministic transition during post-storm succession.
+
+In Euks, will need to add:
+### Global procrustes: temporal continuity of assemblage compositions
+Tests overall alignment of 16S and 18S assemblage ordinations across all timepoints.
+
+
+
+
+
+
+## Varience partitioning
+Quantifies the unique and shared contributions of physicochemical and nutrient variables in explaining global microbial assemblage variation.
+```{r}
+# Partition the variation of assemblage matrix by explanatory matricies
+varpart(ps_dist_coreg, pchem_mat, nuts_mat)
+```
+**Methods:** To quantify the relative and shared contributions of physicochemical and nutrient variables to variation in microbial community composition, variance partitioning was conducted using the varpart function in the vegan package. Bray–Curtis dissimilarities among bacterial assemblages were used as the response matrix (Y), while explanatory matrices included (1) physicochemical parameters (pchem_mat; temperature, salinity, dissolved oxygen, pH, turbidity) and (2) nutrient concentrations (nuts_mat; NO₃⁻, NO₂⁻, NH₃, PO₄³⁻, SiO₂). All environmental variables were scaled prior to analysis. The partitioning model estimated the proportion of total community variation explained uniquely by each variable group and jointly by both. Significance of unique fractions was assessed using distance-based redundancy analysis (dbRDA) and permutation tests (999 permutations).
+
+**Results:** Variance partitioning revealed that physicochemical and nutrient factors together explained 48.3% of the adjusted variation in bacterial community composition. Of this total, 11.4% of the variation was uniquely attributed to physicochemical parameters, 9.2% was uniquely attributed to nutrient concentrations, and 27.7% represented shared explanatory power between the two groups. The remaining 51.7% of the variance was unexplained, likely reflecting unmeasured biotic or stochastic processes. These results indicate that both physicochemical and nutrient gradients jointly structured microbial assemblages following the storm, with substantial covariation between the two drivers consistent with hydrologically coupled changes in water column conditions.
+
+
+
+

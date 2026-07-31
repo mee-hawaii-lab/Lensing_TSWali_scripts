@@ -1,0 +1,2422 @@
+---
+title: "Tidal Stage Assignment & Hydrodynamic Analysis — He"eia Fishpond"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+## Purpose
+Assign tidal stage to Storm Wali discrete water-quality samples and characterize how Storm Wali disrupted the tidal dynamics of He"eia Fishpond (HFP).
+
+## 0. Setup
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(lunar)
+library(knitr)
+library(patchwork)
+
+# ---- File paths (adjust per project) -----------------------------------------
+input_path  <- "/Users/becca/Documents/current projects/Manuscript Storm Wali/data/raw"
+output_path <- "/Users/becca/Documents/current projects/Manuscript Storm Wali/data/processed/hydrometeorology/tides"
+figure_path <- "/Users/becca/Documents/current projects/Manuscript Storm Wali/output/figure_supp1_tidal_dynamics"
+
+path_samples  <- file.path(input_path, "../processed/physicochemistry/sample_data.csv")
+path_ctd      <- file.path(output_path, "../ctd_extracted_data/ctd_extracted_pressure.csv")
+
+# NOAA observed (verified) 6-min water levels
+path_obs_jun  <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_tides_june.csv")
+path_obs_jul  <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_tides_july.csv")
+path_obs_aug  <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_tides_august.csv")
+
+# NOAA harmonic predictions (High/Low only) — used for major/minor classification
+path_tide_jun <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_predictions_june.txt")
+path_tide_jul <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_predictions_july.txt")
+path_tide_aug <- file.path(input_path, "hydrometeorology/tides/noaa_mokh1_predictions_august.txt")
+
+# ---- Storm Wali date window (HST) -------------------------------------------
+# Storm onset Jul 20; impacts persist through Jul 23.
+STORM_START <- ymd("2014-07-20", tz = "Pacific/Honolulu")
+STORM_END   <- ymd("2014-07-23", tz = "Pacific/Honolulu")   # Jul 20-22 = 3 full calendar days; all rainfall + 1 day hydrological lag
+
+# Visualization-only: storm shading extends back to broader rainfall onset on
+# Oahu (~18:00 HST Jul 19, per UH meteorological records). Used in Figure S1
+# storm-shading rectangles only; analytical period boundaries use STORM_START
+# / STORM_END above.
+STORM_SHADING_START <- ymd_hms("2014-07-19 18:00:00", tz = "Pacific/Honolulu")
+STORM_SHADING_END   <- STORM_END
+```
+
+---
+
+## 1. Load & tidy sample data
+```{r load-samples}
+samples_raw <- read_csv(path_samples, show_col_types = FALSE)
+
+sampling_events <- samples_raw %>%
+  select(Date, Field_Time_Start, Field_Time_Finish) %>%
+  distinct() %>%
+  mutate(
+    Date_parsed = suppressWarnings(ymd(Date)),
+
+    # Coerce time columns to "HH:MM" strings
+    time_start_chr  = str_extract(as.character(Field_Time_Start),  "^\\d{1,2}:\\d{2}"),
+    time_finish_chr = str_extract(as.character(Field_Time_Finish), "^\\d{1,2}:\\d{2}"),
+
+    # POSIXct datetimes in HST
+    start_dt = ymd_hm(paste(format(Date_parsed, "%Y-%m-%d"), time_start_chr),
+                       tz = "Pacific/Honolulu"),
+    finish_dt = case_when(
+      !is.na(time_finish_chr) ~
+        ymd_hm(paste(format(Date_parsed, "%Y-%m-%d"), time_finish_chr),
+               tz = "Pacific/Honolulu"),
+      TRUE ~ NA_POSIXct_
+    ),
+
+    duration_h = as.numeric(difftime(finish_dt, start_dt, units = "hours")),
+
+    # Window imputation: missing finish OR duration > 3 h → cap at 1.5 h
+    window_flag = case_when(
+      is.na(finish_dt) ~ "imputed_no_finish",
+      duration_h > 3   ~ "imputed_long_duration",
+      TRUE             ~ "observed"
+    ),
+    assess_end_dt = case_when(
+      window_flag != "observed" ~ start_dt + dminutes(90),
+      TRUE                      ~ finish_dt
+    ),
+    midpoint_dt = start_dt + (assess_end_dt - start_dt) / 2
+  ) %>%
+  filter(!is.na(Date_parsed))
+
+stopifnot(nrow(sampling_events) > 0)
+
+message("=== Sampling Events ===")
+print(
+  sampling_events %>%
+    select(Date, Field_Time_Start, Field_Time_Finish, window_flag,
+           start_dt, assess_end_dt, midpoint_dt),
+  n = 20
+)
+```
+
+---
+
+## 2. Load NOAA verified 6-min water levels & detect High/Low extrema
+```{r load-noaa-obs}
+# 2a. Parse verified water levels ---------------------------------------------
+# read_csv auto-parses Date as <date> and Time (LST) as <time> (hms);
+# combine directly rather than string-pasting.
+parse_noaa_obs <- function(filepath) {
+  raw <- read_csv(filepath, show_col_types = FALSE)
+
+  message(sprintf("  %s — %d cols (%d rows): %s",
+                  basename(filepath), ncol(raw), nrow(raw),
+                  paste(names(raw), collapse = ", ")))
+
+  # Standardise column names via partial match
+  cnames <- tolower(names(raw))
+  date_col     <- names(raw)[str_detect(cnames, "^date")][1]
+  time_col     <- names(raw)[str_detect(cnames, "time")][1]
+  pred_col     <- names(raw)[str_detect(cnames, "predict")][1]
+  verified_col <- names(raw)[str_detect(cnames, "verif")][1]
+
+  raw %>%
+    rename(date_val    = !!date_col,
+           time_val    = !!time_col,
+           pred_m     = !!pred_col,
+           verified_m = !!verified_col) %>%
+    mutate(
+      # Combine: force date to Date class, force time to seconds-since-midnight
+      date_clean = as.Date(date_val),
+      time_secs  = as.numeric(hms::as_hms(time_val)),  # seconds since midnight
+
+      # Build POSIXct = midnight HST + seconds offset
+      datetime = as.POSIXct(as.numeric(as.POSIXct(date_clean,
+                                                    tz = "Pacific/Honolulu")) +
+                              time_secs,
+                            origin = "1970-01-01",
+                            tz = "Pacific/Honolulu"),
+
+      pred_m     = suppressWarnings(as.numeric(pred_m)),
+      verified_m = suppressWarnings(as.numeric(verified_m))
+    ) %>%
+    select(datetime, pred_m, verified_m) %>%
+    filter(!is.na(datetime), !is.na(verified_m))
+}
+
+noaa_obs <- bind_rows(
+  parse_noaa_obs(path_obs_jun),
+  parse_noaa_obs(path_obs_jul),
+  parse_noaa_obs(path_obs_aug)
+) %>%
+  arrange(datetime) %>%
+  distinct()
+
+message(sprintf("\nNOAA observed water levels: %d rows  (%s to %s)",
+                nrow(noaa_obs),
+                format(min(noaa_obs$datetime), "%Y-%m-%d"),
+                format(max(noaa_obs$datetime), "%Y-%m-%d")))
+```
+
+
+```{r detect-noaa-extrema}
+# 2b. Detect High/Low extrema from verified signal ----------------------------
+# Hawaii tidal period ~12.4 h; half-window of 3 h (180 min) separates
+# successive highs/lows while avoiding false detections.
+
+EXTREMA_HALF_WINDOW_MIN <- 220L
+
+detect_extrema <- function(obs_df, half_window_min = EXTREMA_HALF_WINDOW_MIN) {
+  hw <- dminutes(half_window_min)
+
+  candidates <- obs_df %>%
+    mutate(
+      is_high = map_lgl(seq_len(n()), function(i) {
+        win <- obs_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        verified_m[i] == max(win$verified_m, na.rm = TRUE)
+      }),
+      is_low = map_lgl(seq_len(n()), function(i) {
+        win <- obs_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        verified_m[i] == min(win$verified_m, na.rm = TRUE)
+      })
+    ) %>%
+    filter(is_high | is_low) %>%
+    mutate(tide_type = case_when(
+      is_high & !is_low ~ "H",
+      is_low & !is_high ~ "L",
+      # Tie: both high and low in the same window (flat water) — skip
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(tide_type))
+
+  # Collapse duplicate detections (same extremum at adjacent 6-min steps)
+  candidates %>%
+    arrange(datetime) %>%
+    mutate(type_run = cumsum(tide_type != lag(tide_type, default = ""))) %>%
+    group_by(type_run) %>%
+    slice(
+      if (first(tide_type) == "H") which.max(verified_m)
+      else which.min(verified_m)
+    ) %>%
+    ungroup() %>%
+    select(datetime, verified_m, pred_m, tide_type) %>%
+    arrange(datetime)
+}
+
+message("Detecting tidal extrema from verified water levels (this may take ~30 s)...")
+stopifnot(nrow(noaa_obs) > 0)
+tides_noaa <- detect_extrema(noaa_obs)
+
+message(sprintf("Detected %d tidal extrema from verified signal", nrow(tides_noaa)))
+print(head(tides_noaa, 10))
+```
+
+```{r load-harmonic-predictions}
+# 2c. Load NOAA harmonic H/L predictions for major/minor classification --------
+parse_noaa_hl <- function(filepath) {
+  raw <- suppressWarnings(
+    read.table(filepath, header = FALSE, skip = 14, sep = "\t",
+               fill = TRUE, stringsAsFactors = FALSE)
+  )
+  
+  # Select only columns with data (skip empty columns from double-tabs)
+  raw <- raw[, colSums(raw != "" & !is.na(raw)) > 0]
+  names(raw) <- c("Date", "Day", "Time", "Pred", "HighLow")
+  
+  message(sprintf("  %s — %d rows", basename(filepath), nrow(raw)))
+  
+  raw %>%
+    filter(nchar(Date) > 0, !is.na(Pred)) %>%
+    mutate(
+      datetime  = ymd_hm(paste(Date, Time), tz = "Pacific/Honolulu"),
+      pred_m   = as.numeric(Pred),
+      tide_type = trimws(HighLow)
+    ) %>%
+    filter(!is.na(datetime)) %>%
+    select(datetime, pred_m, tide_type) %>%
+    arrange(datetime)
+}
+
+harmonic_hl <- bind_rows(
+  parse_noaa_hl(path_tide_jun),
+  parse_noaa_hl(path_tide_jul),
+  parse_noaa_hl(path_tide_aug)
+) %>% arrange(datetime)
+
+# Classify major/minor: compare each extremum to the next same-type extremum
+harmonic_hl <- harmonic_hl %>%
+  group_by(tide_type) %>%
+  mutate(
+    next_pred = lead(pred_m),
+    constituent = case_when(
+      tide_type == "H" & pred_m >= next_pred ~ "Major",
+      tide_type == "H" & pred_m <  next_pred ~ "Minor",
+      tide_type == "L" & pred_m <= next_pred ~ "Major",
+      tide_type == "L" & pred_m >  next_pred ~ "Minor",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(constituent = ifelse(is.na(constituent), lag(constituent), constituent)) %>%
+  ungroup() %>%
+  select(datetime, pred_m, tide_type, constituent) %>%
+  arrange(datetime)
+
+message(sprintf("\nLoaded %d harmonic H/L predictions", nrow(harmonic_hl)))
+print(harmonic_hl %>% count(tide_type, constituent))
+```
+
+---
+
+## 3. Load CTD pressure data
+```{r load-ctd}
+ctd <- read_csv(path_ctd, show_col_types = FALSE) %>%
+  mutate(
+    datetime = ymd_hms(datetime, tz = "Pacific/Honolulu"),
+    pressure = as.numeric(pressure)
+  ) %>%
+  arrange(datetime)
+
+ctd_range <- range(as.Date(ctd$datetime))
+message(sprintf("CTD data:   %d rows  (%s to %s)",
+                nrow(ctd), ctd_range[1], ctd_range[2]))
+```
+
+---
+
+## 4. Extract local tidal extrema from CTD within NOAA-guided windows
+```{r extract-local-extrema}
+# Search window around each NOAA-detected extremum.
+# Observed fishpond lags are ~40–90 min; 180 min post-NOAA provides buffer.
+# Fishpond should never physically lead the open-ocean NOAA gauge, so
+# SEARCH_BEFORE_MIN = 0.  Observed lags may reach ~180 min; 180 min
+# provides ample buffer for spring/king tide conditions.
+SEARCH_BEFORE_MIN <- 0L
+SEARCH_AFTER_MAX  <- 180L
+
+find_local_extremum <- function(noaa_time, noaa_type, ctd_data, obs_data) {
+  win <- ctd_data %>%
+    filter(datetime >= noaa_time - dminutes(SEARCH_BEFORE_MIN),
+           datetime <= noaa_time + dminutes(SEARCH_AFTER_MAX))
+  if (nrow(win) < 3) {
+    return(list(local_dt = NA, local_p = NA, lag_min = NA,
+                noaa_obs_m = NA, noaa_pred_m = NA))
+  }
+
+  idx <- if (noaa_type == "H") which.max(win$pressure) else which.min(win$pressure)
+  local_time <- win$datetime[idx]
+
+  # Nearest 6-min NOAA observation at the CTD extremum time
+  noaa_near <- obs_data %>%
+    filter(abs(as.numeric(difftime(datetime, local_time, units = "mins"))) <= 6) %>%
+    slice_min(abs(as.numeric(difftime(datetime, local_time, units = "mins"))),
+              n = 1, with_ties = FALSE)
+
+  list(
+    local_dt     = local_time,
+    local_p      = win$pressure[idx],
+    lag_min      = as.numeric(difftime(local_time, noaa_time, units = "mins")),
+    noaa_obs_m  = if (nrow(noaa_near) > 0) noaa_near$verified_m else NA_real_,
+    noaa_pred_m = if (nrow(noaa_near) > 0) noaa_near$pred_m     else NA_real_
+  )
+}
+
+# Restrict NOAA events to dates surrounding sampling (±1 day)
+sample_date_range <- seq(
+  min(sampling_events$Date_parsed, na.rm = TRUE) - 1,
+  max(sampling_events$Date_parsed, na.rm = TRUE) + 1,
+  by = "day"
+)
+
+noaa_subset <- tides_noaa %>%
+  filter(as.Date(datetime) %in% sample_date_range)
+
+local_extrema <- noaa_subset %>%
+  rename(noaa_dt          = datetime,
+         noaa_verified_m = verified_m,
+         noaa_pred_hl_m  = pred_m,
+         noaa_type        = tide_type) %>%
+  rowwise() %>%
+  mutate(
+    extr         = list(find_local_extremum(noaa_dt, noaa_type, ctd, noaa_obs)),
+    local_dt     = extr[["local_dt"]],
+    local_p      = extr[["local_p"]],
+    lag_min      = extr[["lag_min"]],
+    noaa_obs_m  = extr[["noaa_obs_m"]],
+    noaa_pred_m = extr[["noaa_pred_m"]]
+  ) %>%
+  ungroup() %>%
+  select(-extr) %>%
+  filter(!is.na(local_dt)) %>%
+  arrange(local_dt)
+
+message(sprintf("\nLocal CTD extrema: %d events", nrow(local_extrema)))
+print(local_extrema %>%
+        select(noaa_dt, noaa_type, noaa_verified_m, local_dt, local_p,
+               lag_min, noaa_obs_m))
+```
+
+---
+
+## 5. Assign tidal stage to each sampling event
+```{r assign-tidal-stage}
+STAGE_WINDOW_MIN <- 30L
+
+assign_tidal_stage <- function(query_time, extrema_df) {
+  if (is.na(query_time)) return(NA_character_)
+  if (nrow(extrema_df) == 0) return("Unknown - no CTD extrema")
+
+  before <- extrema_df %>% filter(local_dt <= query_time) %>% slice_tail(n = 1)
+  after  <- extrema_df %>% filter(local_dt  > query_time) %>% slice_head(n = 1)
+
+  # Within ±STAGE_WINDOW_MIN of an extremum?
+  if (nrow(before) > 0) {
+    dt_b <- abs(as.numeric(difftime(query_time, before$local_dt, units = "mins")))
+    if (dt_b <= STAGE_WINDOW_MIN)
+      return(if (before$noaa_type == "H") "High" else "Low")
+  }
+  if (nrow(after) > 0) {
+    dt_a <- abs(as.numeric(difftime(after$local_dt, query_time, units = "mins")))
+    if (dt_a <= STAGE_WINDOW_MIN)
+      return(if (after$noaa_type == "H") "High" else "Low")
+  }
+
+  # Between two extrema → infer direction
+  if (nrow(before) > 0 & nrow(after) > 0) {
+    return(case_when(
+      before$noaa_type == "H" & after$noaa_type == "L" ~ "Falling (Ebb)",
+      before$noaa_type == "L" & after$noaa_type == "H" ~ "Rising (Flood)",
+      before$noaa_type == "H"                           ~ "Falling (Ebb)",
+      TRUE                                              ~ "Rising (Flood)"
+    ))
+  }
+  if (nrow(before) == 0)
+    return(if (after$noaa_type == "H") "Rising (Flood)" else "Falling (Ebb)")
+  return(if (before$noaa_type == "H") "Falling (Ebb)" else "Rising (Flood)")
+}
+
+# Majority-stage helper for switching windows
+majority_stage <- function(win_start, win_end, extrema_df) {
+  crossings <- extrema_df %>%
+    filter(local_dt > win_start, local_dt < win_end) %>%
+    arrange(local_dt)
+
+  if (nrow(crossings) == 0)
+    return(list(stage = NA_character_, note = NA_character_))
+
+  crossing_dt   <- crossings$local_dt[1]
+  crossing_type <- crossings$noaa_type[1]
+
+  win_total_min <- as.numeric(difftime(win_end, win_start, units = "mins"))
+  seg1_min      <- as.numeric(difftime(crossing_dt, win_start, units = "mins"))
+  seg2_min      <- as.numeric(difftime(win_end, crossing_dt, units = "mins"))
+
+  stage_before <- if (crossing_type == "H") "Rising (Flood)" else "Falling (Ebb)"
+  stage_after  <- if (crossing_type == "H") "Falling (Ebb)"  else "Rising (Flood)"
+
+  pct_before <- round(100 * seg1_min / win_total_min)
+  pct_after  <- round(100 * seg2_min / win_total_min)
+
+  list(
+    stage = if (seg1_min >= seg2_min) stage_before else stage_after,
+    note  = sprintf("%d%% %s / %d%% %s",
+                    pct_before, stage_before,
+                    pct_after, stage_after)
+  )
+}
+
+tidal_stage_results <- sampling_events %>%
+  mutate(
+    stage_at_start = map_chr(start_dt,     ~ assign_tidal_stage(.x, local_extrema)),
+    stage_at_mid   = map_chr(midpoint_dt,  ~ assign_tidal_stage(.x, local_extrema)),
+    stage_at_end   = map_chr(assess_end_dt,~ assign_tidal_stage(.x, local_extrema)),
+
+    Tide_Switching = (stage_at_start != stage_at_end),
+
+    majority       = map2(start_dt, assess_end_dt,
+                          ~ majority_stage(.x, .y, local_extrema)),
+    majority_stage_val  = map_chr(majority, "stage"),
+    Tide_Stage_Split    = map_chr(majority, "note"),
+
+    Tide_Stage_Majority = case_when(
+      !Tide_Switching            ~ stage_at_mid,
+      !is.na(majority_stage_val) ~ majority_stage_val,
+      TRUE                       ~ stage_at_mid
+    ),
+    Tide_Stage_Split = case_when(
+      !Tide_Switching ~ paste0("100% ", Tide_Stage_Majority),
+      TRUE            ~ Tide_Stage_Split
+    )
+  ) %>%
+  select(
+    Date, Date_parsed, Field_Time_Start, Field_Time_Finish,
+    window_flag, duration_h,
+    start_dt, assess_end_dt, midpoint_dt,
+    stage_at_start, stage_at_mid, stage_at_end,
+    Tide_Stage_Majority, Tide_Switching, Tide_Stage_Split
+  )
+
+message("\n=== TIDAL STAGE ASSIGNMENT RESULTS ===\n")
+print(
+  tidal_stage_results %>%
+    select(Date, Field_Time_Start, Field_Time_Finish, window_flag,
+           Tide_Stage_Majority, Tide_Switching, Tide_Stage_Split),
+  n = 20
+)
+```
+
+---
+
+## 6. Merge tidal stage onto full sample dataset & save
+```{r merge-and-save}
+samples_with_stage <- samples_raw %>%
+  mutate(Date_parsed = suppressWarnings(ymd(Date))) %>%
+  left_join(
+    tidal_stage_results %>%
+      select(Date_parsed, Field_Time_Start, Tide_Stage_Majority, window_flag,
+             Tide_Switching, Tide_Stage_Split, start_dt, assess_end_dt, midpoint_dt),
+    by = c("Date_parsed", "Field_Time_Start")
+  ) %>%
+  select(-Date_parsed) %>%
+  relocate(Tide_Stage_Majority, Tide_Switching, Tide_Stage_Split, window_flag,
+           .after = Field_Time_Finish)
+```
+
+---
+
+## 7. Moon phase, tidal regime, & height-difference calculations
+```{r moon-phase-regime}
+# 7a. Daily moon phase for every date in the CTD record -----------------------
+ctd_dates <- tibble(
+  date = seq(as.Date(min(ctd$datetime)),
+             as.Date(max(ctd$datetime)),
+             by = "day")
+) %>%
+  mutate(
+    moon_phase_rad  = lunar.phase(date),
+    moon_phase_deg  = moon_phase_rad * (180 / pi),
+    moon_phase_frac = moon_phase_rad / (2 * pi),
+
+    moon_phase_name = case_when(
+      moon_phase_frac < 0.0625 | moon_phase_frac >= 0.9375 ~ "New Moon",
+      moon_phase_frac < 0.1875  ~ "Waxing Crescent",
+      moon_phase_frac < 0.3125  ~ "First Quarter",
+      moon_phase_frac < 0.4375  ~ "Waxing Gibbous",
+      moon_phase_frac < 0.5625  ~ "Full Moon",
+      moon_phase_frac < 0.6875  ~ "Waning Gibbous",
+      moon_phase_frac < 0.8125  ~ "Last Quarter",
+      TRUE                      ~ "Waning Crescent"
+    ),
+
+    # Spring / Neap classification (±2 days of lunar synodic cycle)
+    dist_to_new  = pmin(moon_phase_frac, 1 - moon_phase_frac),
+    dist_to_full = abs(moon_phase_frac - 0.5),
+    tidal_regime = case_when(
+      pmin(dist_to_new, dist_to_full) < (2 / 29.53) ~ "Spring",
+      abs(moon_phase_frac - 0.25)    < (2 / 29.53)  ~ "Neap",
+      abs(moon_phase_frac - 0.75)    < (2 / 29.53)  ~ "Neap",
+      TRUE                                           ~ "Intermediate"
+    )
+  ) %>%
+  select(-dist_to_new, -dist_to_full)
+
+# 7b. Lunar perigee detection -------------------------------------------------
+PERIGEE_THRESHOLD <- 0.98
+
+ctd_dates <- ctd_dates %>%
+  mutate(
+    lunar_distance = lunar.distance(date),
+    near_perigee   = lunar_distance < PERIGEE_THRESHOLD,
+    is_king_tide   = near_perigee & tidal_regime == "Spring"
+  )
+
+king_tide_dates <- ctd_dates %>% filter(is_king_tide) %>% pull(date)
+message(sprintf("King Tide dates in CTD period: %s",
+                paste(format(king_tide_dates, "%b %d"), collapse = ", ")))
+
+# 7c. Attach moon phase & regime to local_extrema ----------------------------
+local_extrema <- local_extrema %>%
+  mutate(date = as.Date(local_dt)) %>%
+  left_join(ctd_dates %>%
+              select(date, moon_phase_frac, moon_phase_name,
+                     tidal_regime, lunar_distance, near_perigee, is_king_tide),
+            by = "date") %>%
+  select(-date)
+
+# 7d. Attach moon phase to tidal_stage_results & samples_with_stage ----------
+tidal_stage_results <- tidal_stage_results %>%
+  left_join(ctd_dates %>%
+              select(date, moon_phase_frac, moon_phase_name,
+                     tidal_regime, lunar_distance, near_perigee, is_king_tide),
+            by = c("Date_parsed" = "date"))
+
+samples_with_stage <- samples_with_stage %>%
+  mutate(Date_parsed = suppressWarnings(ymd(Date))) %>%
+  left_join(ctd_dates %>%
+              select(date, moon_phase_frac, moon_phase_name,
+                     tidal_regime, lunar_distance, near_perigee, is_king_tide),
+            by = c("Date_parsed" = "date")) %>%
+  select(-Date_parsed)
+```
+
+---
+
+## 8. Storm Wali disruption analysis
+
+This section quantifies how Storm Wali (July 20–23, 2014) disrupted tidal
+dynamics at HFP.  We compare mean high-water and mean low-water levels
+before, during, and after the storm, and classify tidal extrema into
+major and minor constituents to separate the physical fishpond response
+from mixed semi-diurnal aliasing.
+
+```{r major-minor-classification}
+# ---------- 8a. Build full-CTD-period local extrema ---------------------------
+noaa_full_period <- tides_noaa %>%
+  filter(as.Date(datetime) >= as.Date(min(ctd$datetime)) - 1,
+         as.Date(datetime) <= as.Date(max(ctd$datetime)) + 1)
+
+local_extrema_full <- noaa_full_period %>%
+  rename(noaa_dt          = datetime,
+         noaa_verified_m = verified_m,
+         noaa_pred_hl_m  = pred_m,
+         noaa_type        = tide_type) %>%
+  rowwise() %>%
+  mutate(
+    extr     = list(find_local_extremum(noaa_dt, noaa_type, ctd, noaa_obs)),
+    local_dt = extr[["local_dt"]],
+    local_p  = extr[["local_p"]],
+    lag_min  = extr[["lag_min"]]
+  ) %>%
+  ungroup() %>%
+  select(-extr) %>%
+  filter(!is.na(local_dt)) %>%
+  arrange(local_dt)
+
+# ---------- 8b. Classify major vs minor tidal constituents --------------------
+# Hawai"i has a mixed semi-diurnal tide (two unequal high/low pairs per day).
+# Mākāhā act as a low-pass filter, attenuating the minor oscillation; minor
+# NOAA events often match to noise peaks (lag < 10 min) rather than true
+# fishpond responses.
+# Classification: for each consecutive same-type pair (H1 ... L ... H2), the
+# extremum with larger NOAA height (H) or smaller height (L) = Major; the
+# other = Minor.
+
+classify_major_minor <- function(ext_df) {
+  ext_df <- ext_df %>% arrange(noaa_dt)
+  n <- nrow(ext_df)
+  ext_df$constituent <- NA_character_
+
+  for (i in seq_len(n - 2)) {
+    j <- i + 2
+    if (j > n) next
+    if (ext_df$noaa_type[i] != ext_df$noaa_type[j]) next
+
+    if (ext_df$noaa_type[i] == "H") {
+      if (ext_df$noaa_verified_m[i] >= ext_df$noaa_verified_m[j]) {
+        ext_df$constituent[i] <- "Major"
+        if (is.na(ext_df$constituent[j])) ext_df$constituent[j] <- "Minor"
+      } else {
+        ext_df$constituent[i] <- "Minor"
+        if (is.na(ext_df$constituent[j])) ext_df$constituent[j] <- "Major"
+      }
+    } else {
+      if (ext_df$noaa_verified_m[i] <= ext_df$noaa_verified_m[j]) {
+        ext_df$constituent[i] <- "Major"
+        if (is.na(ext_df$constituent[j])) ext_df$constituent[j] <- "Minor"
+      } else {
+        ext_df$constituent[i] <- "Minor"
+        if (is.na(ext_df$constituent[j])) ext_df$constituent[j] <- "Major"
+      }
+    }
+  }
+
+  # Fill remaining NAs at edges using median of known values per type
+  for (tt in c("H", "L")) {
+    idx_na    <- which(ext_df$noaa_type == tt & is.na(ext_df$constituent))
+    idx_known <- which(ext_df$noaa_type == tt & !is.na(ext_df$constituent))
+    if (length(idx_known) == 0 | length(idx_na) == 0) next
+    med_val <- median(ext_df$noaa_verified_m[idx_known])
+    for (k in idx_na) {
+      if (tt == "H") {
+        ext_df$constituent[k] <- if (ext_df$noaa_verified_m[k] >= med_val) "Major" else "Minor"
+      } else {
+        ext_df$constituent[k] <- if (ext_df$noaa_verified_m[k] <= med_val) "Major" else "Minor"
+      }
+    }
+  }
+  ext_df
+}
+
+local_extrema_full <- classify_major_minor(local_extrema_full)
+
+message("\n=== MAJOR / MINOR CLASSIFICATION ===")
+print(local_extrema_full %>% count(noaa_type, constituent))
+
+# ---------- 8b-ii. CTD prominence filter --------------------------------------
+# Even for Major NOAA events, the CTD search sometimes matches a noise peak
+# near t=0 rather than the true fishpond response (producing spuriously small
+# lags). Prominence = how much the matched CTD extremum stands out from
+# surrounding values; flags real responses from noise.
+#
+#   For a CTD High: prominence = local_p - min(CTD within ±PROM_WINDOW_MIN)
+#   For a CTD Low:  prominence = max(CTD within ±PROM_WINDOW_MIN) - local_p
+#
+# Matches with prominence below PROM_THRESHOLD_DBAR flagged as low-confidence.
+
+PROM_WINDOW_MIN    <- 90L     # minutes either side for prominence calc
+PROM_THRESHOLD_DBAR <- 0.03   # minimum prominence to be "high confidence"
+
+compute_prominence <- function(ext_df, ctd_data,
+                                prom_window = PROM_WINDOW_MIN,
+                                prom_thresh = PROM_THRESHOLD_DBAR) {
+  pw <- dminutes(prom_window)
+  
+  ext_df %>%
+    rowwise() %>%
+    mutate(
+      # Get CTD values within ±prom_window of the matched time
+      prom_val = {
+        win <- ctd_data %>%
+          filter(datetime >= local_dt - pw,
+                 datetime <= local_dt + pw)
+        if (nrow(win) < 3) {
+          NA_real_
+        } else if (noaa_type == "H") {
+          local_p - min(win$pressure, na.rm = TRUE)
+        } else {
+          max(win$pressure, na.rm = TRUE) - local_p
+        }
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(
+      confidence = case_when(
+        is.na(prom_val)            ~ "Unknown",
+        prom_val >= prom_thresh    ~ "High",
+        TRUE                       ~ "Low"
+      )
+    )
+}
+
+message("Computing CTD prominence for each matched extremum...")
+local_extrema_full <- compute_prominence(local_extrema_full, ctd)
+
+message("\n=== PROMINENCE SUMMARY ===")
+print(
+  local_extrema_full %>%
+    group_by(noaa_type, constituent, confidence) %>%
+    summarise(n = n(),
+              mean_prom = round(mean(prom_val, na.rm = TRUE), 4),
+              mean_lag  = round(mean(lag_min, na.rm = TRUE), 1),
+              .groups = "drop") %>%
+    arrange(noaa_type, constituent, confidence)
+)
+
+# High-confidence major events = true fishpond tidal responses
+n_hc_major <- local_extrema_full %>%
+  filter(constituent == "Major", confidence == "High") %>%
+  nrow()
+message(sprintf("\nHigh-confidence major extrema: %d (used for lag & storm analysis)", n_hc_major))
+
+message("\nLag statistics by constituent + confidence:")
+print(
+  local_extrema_full %>%
+    filter(!is.na(lag_min)) %>%
+    group_by(noaa_type, constituent, confidence) %>%
+    summarise(n = n(),
+              mean_lag = round(mean(lag_min), 1),
+              sd_lag   = round(sd(lag_min), 1),
+              median_lag = round(median(lag_min), 1),
+              .groups = "drop")
+)
+```
+
+```{r independent-ctd-extrema}
+# ---------- 8c. Detect CTD tidal extrema INDEPENDENTLY ------------------------
+# Previous approach searched CTD within a window around each NOAA event,
+# biasing toward CTD peaks coincident with NOAA times.
+#
+# Current approach: detect CTD peaks/troughs via rolling-window method (same
+# algorithm as NOAA verified signal in Section 2b), classify as major/minor
+# within CTD itself, then match NOAA major events to CTD major events by
+# nearest-subsequent same-type pairing.
+#
+# Eliminates the search-window bias since CTD peaks are found purely from
+# the CTD pressure shape.
+
+CTD_EXTREMA_HALF_WINDOW_MIN <- 180L  # min either side; must separate
+                                      # consecutive same-type extrema
+                                      # (~6 h apart in semi-diurnal regime)
+
+detect_ctd_extrema <- function(ctd_df, half_window_min = CTD_EXTREMA_HALF_WINDOW_MIN) {
+  hw <- dminutes(half_window_min)
+
+  candidates <- ctd_df %>%
+    mutate(
+      is_high = map_lgl(seq_len(n()), function(i) {
+        win <- ctd_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        pressure[i] == max(win$pressure, na.rm = TRUE)
+      }),
+      is_low = map_lgl(seq_len(n()), function(i) {
+        win <- ctd_df %>%
+          filter(datetime >= datetime[i] - hw,
+                 datetime <= datetime[i] + hw)
+        pressure[i] == min(win$pressure, na.rm = TRUE)
+      })
+    ) %>%
+    filter(is_high | is_low) %>%
+    mutate(ctd_type = case_when(
+      is_high & !is_low ~ "H",
+      is_low & !is_high ~ "L",
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(ctd_type))
+
+  # Collapse runs of same type to single peak
+  candidates %>%
+    arrange(datetime) %>%
+    mutate(type_run = cumsum(ctd_type != lag(ctd_type, default = ""))) %>%
+    group_by(type_run) %>%
+    slice(
+      if (first(ctd_type) == "H") which.max(pressure)
+      else which.min(pressure)
+    ) %>%
+    ungroup() %>%
+    select(datetime, pressure, ctd_type) %>%
+    arrange(datetime)
+}
+
+message("Detecting CTD tidal extrema independently (this may take 1-2 min)...")
+ctd_extrema_ind <- detect_ctd_extrema(ctd)
+message(sprintf("Detected %d independent CTD extrema", nrow(ctd_extrema_ind)))
+print(head(ctd_extrema_ind, 10))
+
+# ---------- 8d. Classify CTD extrema as major/minor --------------------------
+# Same logic as NOAA classification: consecutive same-type pair,
+# the one with higher pressure (for H) or lower (for L) is Major.
+
+classify_ctd_major_minor <- function(ext_df) {
+  ext_df <- ext_df %>% arrange(datetime)
+  n <- nrow(ext_df)
+  ext_df$ctd_constituent <- NA_character_
+
+  for (i in seq_len(n - 2)) {
+    j <- i + 2
+    if (j > n) next
+    if (ext_df$ctd_type[i] != ext_df$ctd_type[j]) next
+
+    if (ext_df$ctd_type[i] == "H") {
+      if (ext_df$pressure[i] >= ext_df$pressure[j]) {
+        ext_df$ctd_constituent[i] <- "Major"
+        if (is.na(ext_df$ctd_constituent[j])) ext_df$ctd_constituent[j] <- "Minor"
+      } else {
+        ext_df$ctd_constituent[i] <- "Minor"
+        if (is.na(ext_df$ctd_constituent[j])) ext_df$ctd_constituent[j] <- "Major"
+      }
+    } else {
+      if (ext_df$pressure[i] <= ext_df$pressure[j]) {
+        ext_df$ctd_constituent[i] <- "Major"
+        if (is.na(ext_df$ctd_constituent[j])) ext_df$ctd_constituent[j] <- "Minor"
+      } else {
+        ext_df$ctd_constituent[i] <- "Minor"
+        if (is.na(ext_df$ctd_constituent[j])) ext_df$ctd_constituent[j] <- "Major"
+      }
+    }
+  }
+
+  # Fill edge NAs by median comparison
+  for (tt in c("H", "L")) {
+    idx_na    <- which(ext_df$ctd_type == tt & is.na(ext_df$ctd_constituent))
+    idx_known <- which(ext_df$ctd_type == tt & !is.na(ext_df$ctd_constituent))
+    if (length(idx_known) == 0 | length(idx_na) == 0) next
+    med_val <- median(ext_df$pressure[idx_known])
+    for (k in idx_na) {
+      if (tt == "H") {
+        ext_df$ctd_constituent[k] <- if (ext_df$pressure[k] >= med_val) "Major" else "Minor"
+      } else {
+        ext_df$ctd_constituent[k] <- if (ext_df$pressure[k] <= med_val) "Major" else "Minor"
+      }
+    }
+  }
+  ext_df
+}
+
+ctd_extrema_ind <- classify_ctd_major_minor(ctd_extrema_ind)
+
+message("\n=== INDEPENDENT CTD EXTREMA: MAJOR / MINOR ===")
+print(ctd_extrema_ind %>% count(ctd_type, ctd_constituent))
+
+# ---------- 8e. Match NOAA major -> CTD major (independent lag) ---------------
+# For each independently-detected CTD peak, find the most recent preceding
+# NOAA H/L of the same type. Measures the actual propagation delay without
+# requiring alignment of NOAA vs CTD major/minor classifications; the
+# fishpond"s strong low-pass filtering means CTD peak timing doesn"t
+# correspond to NOAA major classification.
+
+MATCH_MAX_LAG_MIN <- 180L  # max lag (4 hours)
+
+# All NOAA detected H/L events (not just "major")
+noaa_all_hl <- noaa_full_period %>%
+  rename(noaa_dt          = datetime,
+         noaa_verified_m = verified_m,
+         noaa_type        = tide_type) %>%
+  select(noaa_dt, noaa_type, noaa_verified_m) %>%
+  arrange(noaa_dt)
+
+# All independently-detected CTD peaks
+ctd_all_peaks <- ctd_extrema_ind %>%
+  rename(ctd_dt = datetime, ctd_p = pressure)
+
+match_results <- vector("list", nrow(ctd_all_peaks))
+
+for (i in seq_len(nrow(ctd_all_peaks))) {
+  c_dt   <- ctd_all_peaks$ctd_dt[i]
+  c_type <- ctd_all_peaks$ctd_type[i]
+  c_p    <- ctd_all_peaks$ctd_p[i]
+
+  # Find the most recent NOAA event of the same type preceding this CTD peak
+  candidates <- noaa_all_hl %>%
+    filter(noaa_type == c_type,
+           noaa_dt < c_dt,
+           noaa_dt >= c_dt - dminutes(MATCH_MAX_LAG_MIN))
+
+  if (nrow(candidates) == 0) {
+    match_results[[i]] <- tibble(
+      ctd_dt = c_dt, ctd_type = c_type, ctd_p = c_p,
+      ctd_constituent = ctd_all_peaks$ctd_constituent[i],
+      noaa_dt = NA_POSIXct_, noaa_type = NA_character_,
+      noaa_verified_m = NA_real_, ind_lag_min = NA_real_
+    )
+  } else {
+    best <- candidates %>% slice_max(noaa_dt, n = 1, with_ties = FALSE)
+    match_results[[i]] <- tibble(
+      ctd_dt = c_dt, ctd_type = c_type, ctd_p = c_p,
+      ctd_constituent = ctd_all_peaks$ctd_constituent[i],
+      noaa_dt          = best$noaa_dt,
+      noaa_type        = best$noaa_type,
+      noaa_verified_m = best$noaa_verified_m,
+      ind_lag_min      = as.numeric(difftime(c_dt, best$noaa_dt, units = "mins"))
+    )
+  }
+}
+
+independent_lag <- bind_rows(match_results) %>%
+  filter(!is.na(ind_lag_min))
+
+# Attach tidal regime and period
+independent_lag <- independent_lag %>%
+  mutate(date = as.Date(noaa_dt)) %>%
+  left_join(ctd_dates %>%
+              select(date, tidal_regime, moon_phase_name),
+            by = "date") %>%
+  select(-date)
+
+message(sprintf("\n=== INDEPENDENT LAG: %d matched pairs ===", nrow(independent_lag)))
+print(
+  independent_lag %>%
+    group_by(noaa_type) %>%
+    summarise(n = n(),
+              mean_lag = round(mean(ind_lag_min), 1),
+              sd_lag   = round(sd(ind_lag_min), 1),
+              median_lag = round(median(ind_lag_min), 1),
+              min_lag = round(min(ind_lag_min), 1),
+              max_lag = round(max(ind_lag_min), 1),
+              .groups = "drop")
+)
+
+message("\n=== INDEPENDENT LAG BY REGIME ===")
+print(
+  independent_lag %>%
+    filter(tidal_regime %in% c("Spring", "Neap")) %>%
+    group_by(noaa_type, tidal_regime) %>%
+    summarise(n = n(),
+              mean_lag = round(mean(ind_lag_min), 1),
+              sd_lag   = round(sd(ind_lag_min), 1),
+              median_lag = round(median(ind_lag_min), 1),
+              .groups = "drop") %>%
+    arrange(noaa_type, tidal_regime)
+)
+```
+
+```{r storm-wali-disruption}
+# ---------- 8f. Define analysis periods ---------------------------------------
+PRE_STORM_DAYS  <- 14L
+POST_STORM_DAYS <- 14L
+
+pre_storm_start <- STORM_START - days(PRE_STORM_DAYS)
+
+ctd_periods <- ctd %>%
+  mutate(
+    period = case_when(
+      datetime >= pre_storm_start & datetime < STORM_START  ~ "Pre-storm",
+      datetime >= STORM_START     & datetime < STORM_END    ~ "Storm",
+      datetime >= STORM_END       & datetime < STORM_END + days(POST_STORM_DAYS) ~ "Post-storm",
+      TRUE ~ "Outside"
+    )
+  )
+
+# ---------- 8g. Mean high-water / low-water from INDEPENDENT CTD extrema ------
+# Uses independently detected CTD major extrema (not NOAA-guided matches)
+# for the storm disruption analysis. Avoids all search-window artifacts.
+
+ctd_major_with_period <- ctd_extrema_ind %>%
+  filter(ctd_constituent == "Major") %>%
+  mutate(
+    period = case_when(
+      datetime >= pre_storm_start & datetime < STORM_START  ~ "Pre-storm",
+      datetime >= STORM_START     & datetime < STORM_END    ~ "Storm",
+      datetime >= STORM_END       & datetime < STORM_END + days(POST_STORM_DAYS) ~ "Post-storm",
+      TRUE ~ "Outside"
+    )
+  )
+
+hw_lw_summary <- ctd_major_with_period %>%
+  filter(period != "Outside") %>%
+  group_by(period, ctd_type) %>%
+  summarise(n         = n(),
+            mean_wl   = round(mean(pressure,   na.rm = TRUE), 4),
+            sd_wl     = round(sd(pressure,     na.rm = TRUE), 4),
+            median_wl = round(median(pressure, na.rm = TRUE), 4),
+            min_wl    = round(min(pressure,    na.rm = TRUE), 4),
+            max_wl    = round(max(pressure,    na.rm = TRUE), 4),
+            .groups = "drop") %>%
+  rename(noaa_type = ctd_type) %>%   # keep column name consistent for plotting
+  mutate(period = factor(period, levels = c("Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(period, noaa_type)
+
+message("\n=== MEAN HIGH/LOW WATER BY PERIOD - INDEPENDENT CTD MAJOR (dbar) ===")
+print(hw_lw_summary)
+
+excursion_summary <- hw_lw_summary %>%
+  select(period, noaa_type, mean_wl) %>%
+  pivot_wider(names_from = noaa_type, values_from = mean_wl, names_prefix = "mean_") %>%
+  mutate(tidal_excursion = round(mean_H - mean_L, 4))
+
+# Per-cycle excursion: pair consecutive H/L extrema in ctd_major_with_period,
+# compute amplitude per pair, then summarise mean ± SD by period.
+excursion_per_cycle <- ctd_major_with_period %>%
+  filter(period != "Outside") %>%
+  arrange(datetime) %>%
+  mutate(next_type     = lead(ctd_type),
+         next_pressure = lead(pressure)) %>%
+  filter(!is.na(next_type), ctd_type != next_type) %>%
+  mutate(amplitude = abs(pressure - next_pressure)) %>%
+  group_by(period) %>%
+  summarise(
+    n_cycles         = n(),
+    excursion_mean   = round(mean(amplitude,   na.rm = TRUE), 4),
+    excursion_sd     = round(sd(amplitude,     na.rm = TRUE), 4),
+    excursion_median = round(median(amplitude, na.rm = TRUE), 4),
+    excursion_min    = round(min(amplitude,    na.rm = TRUE), 4),
+    excursion_max    = round(max(amplitude,    na.rm = TRUE), 4),
+    .groups = "drop"
+  ) %>%
+  mutate(period = factor(period, levels = c("Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(period)
+
+# Merge per-cycle SD back into excursion_summary for symmetric reporting.
+excursion_summary <- excursion_summary %>%
+  left_join(excursion_per_cycle, by = "period")
+
+message("\n=== TIDAL EXCURSION BY PERIOD (dbar) ===")
+print(excursion_summary)
+
+pre_excursion   <- excursion_summary$tidal_excursion[excursion_summary$period == "Pre-storm"]
+storm_excursion <- excursion_summary$tidal_excursion[excursion_summary$period == "Storm"]
+post_excursion  <- excursion_summary$tidal_excursion[excursion_summary$period == "Post-storm"]
+
+pct_excursion_reduction_storm <- round(100 * (1 - storm_excursion / pre_excursion), 1)
+pct_excursion_change_post     <- round(100 * (post_excursion / pre_excursion - 1), 1)
+
+message(sprintf("\nStorm reduced major-tide excursion by %.1f%%", pct_excursion_reduction_storm))
+
+# ---------- 8h. Individual HW/LW shifts --------------------------------------
+pre_hw   <- hw_lw_summary %>% filter(period == "Pre-storm", noaa_type == "H") %>% pull(mean_wl)
+pre_lw   <- hw_lw_summary %>% filter(period == "Pre-storm", noaa_type == "L") %>% pull(mean_wl)
+storm_hw <- hw_lw_summary %>% filter(period == "Storm",     noaa_type == "H") %>% pull(mean_wl)
+storm_lw <- hw_lw_summary %>% filter(period == "Storm",     noaa_type == "L") %>% pull(mean_wl)
+post_hw  <- hw_lw_summary %>% filter(period == "Post-storm", noaa_type == "H") %>% pull(mean_wl)
+post_lw  <- hw_lw_summary %>% filter(period == "Post-storm", noaa_type == "L") %>% pull(mean_wl)
+
+message(sprintf("High-water shift during storm: %+.4f dbar", storm_hw - pre_hw))
+message(sprintf("Low-water shift during storm:  %+.4f dbar", storm_lw - pre_lw))
+
+# ---------- 8i. Continuous mean water level -----------------------------------
+mean_wl_by_period <- ctd_periods %>%
+  filter(period != "Outside") %>%
+  group_by(period) %>%
+  summarise(n_obs              = n(),
+            mean_pressure_dbar   = round(mean(pressure,   na.rm = TRUE), 4),
+            sd_pressure_dbar     = round(sd(pressure,     na.rm = TRUE), 4),
+            median_pressure_dbar = round(median(pressure, na.rm = TRUE), 4),
+            min_pressure_dbar    = round(min(pressure,    na.rm = TRUE), 4),
+            max_pressure_dbar    = round(max(pressure,    na.rm = TRUE), 4),
+            .groups = "drop") %>%
+  mutate(period = factor(period, levels = c("Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(period)
+
+message("\n=== CONTINUOUS MEAN WATER LEVEL BY PERIOD (dbar) ===")
+print(mean_wl_by_period)
+
+# ---------- 8j. Neap/storm confound -------------------------------------------
+ctd_major_with_period <- ctd_major_with_period %>%
+  mutate(date = as.Date(datetime)) %>%
+  left_join(ctd_dates %>% select(date, tidal_regime), by = "date") %>%
+  select(-date)
+
+message("\n=== TIDAL REGIME DURING STORM PERIOD ===")
+print(ctd_major_with_period %>%
+        filter(period == "Storm") %>%
+        count(tidal_regime) %>%
+        mutate(pct = round(100 * n / sum(n), 0)))
+
+# ---------- 8k. Half-cycle tidal range (retained for reference) ---------------
+tidal_ranges <- local_extrema_full %>%
+  mutate(next_p = lead(local_p), next_type = lead(noaa_type),
+         next_dt = lead(local_dt),
+         tidal_range_dbar = abs(local_p - next_p),
+         midpoint = local_dt + (next_dt - local_dt) / 2) %>%
+  filter(!is.na(next_p), noaa_type != next_type) %>%
+  mutate(period = case_when(
+    midpoint >= pre_storm_start & midpoint < STORM_START  ~ "Pre-storm",
+    midpoint >= STORM_START     & midpoint < STORM_END    ~ "Storm",
+    midpoint >= STORM_END       & midpoint < STORM_END + days(POST_STORM_DAYS) ~ "Post-storm",
+    TRUE ~ "Outside"))
+```
+
+---
+
+## 9. Lag analysis: NOAA Moku o Lo"e -> HFP by tide type & tidal regime
+
+Lag is computed using the **independent-matching** method: CTD tidal peaks
+and troughs are detected from the pressure signal alone (Section 8c–d),
+then each NOAA major extremum is matched to the nearest subsequent CTD
+major extremum of the same type. This avoids the search-window bias of the
+original NOAA-guided approach.
+
+```{r lag-analysis}
+# The independent_lag dataframe was built in Section 8e: all CTD-detected
+# extrema (major + minor constituents) matched to the most recent preceding
+# NOAA H/L event of the same type. All matched pairs retained without further
+# constituent filtering — mākāhā attenuate the minor constituent so heavily
+# that the CTD signal is dominated by major-cycle responses, and a CTD-only
+# major filter interacts poorly with the matching algorithm (which does not
+# restrict the NOAA side to majors).
+lag_data <- independent_lag
+
+# ---------- 9a. Overall lag ---------------------------------------------------
+lag_overall <- lag_data %>%
+  group_by(noaa_type) %>%
+  summarise(n = n(),
+            mean_lag   = round(mean(ind_lag_min), 1),
+            sd_lag     = round(sd(ind_lag_min), 1),
+            median_lag = round(median(ind_lag_min), 1),
+            min_lag    = round(min(ind_lag_min), 1),
+            max_lag    = round(max(ind_lag_min), 1),
+            .groups = "drop") %>%
+  rename(tide_type = noaa_type)
+
+message("\n=== INDEPENDENT LAG OVERALL (NOAA major -> CTD major, minutes) ===")
+print(lag_overall)
+
+# ---------- 9b. Lag by tide type x tidal regime --------------------------------
+lag_by_regime <- lag_data %>%
+  group_by(noaa_type, tidal_regime) %>%
+  summarise(n = n(),
+            mean_lag   = round(mean(ind_lag_min), 1),
+            sd_lag     = round(sd(ind_lag_min), 1),
+            median_lag = round(median(ind_lag_min), 1),
+            min_lag    = round(min(ind_lag_min), 1),
+            max_lag    = round(max(ind_lag_min), 1),
+            .groups = "drop") %>%
+  rename(tide_type = noaa_type) %>%
+  arrange(tide_type, tidal_regime)
+
+message("\n=== INDEPENDENT LAG BY REGIME (minutes) ===")
+print(lag_by_regime)
+
+# ---------- 9c. Lag by all regimes (unfiltered diagnostic) -------------------
+lag_by_regime_all <- lag_data %>%
+  group_by(noaa_type, tidal_regime) %>%
+  summarise(n = n(),
+            mean_lag   = round(mean(ind_lag_min), 1),
+            sd_lag     = round(sd(ind_lag_min), 1),
+            median_lag = round(median(ind_lag_min), 1),
+            .groups = "drop") %>%
+  rename(tide_type = noaa_type) %>%
+  arrange(tide_type, tidal_regime)
+
+message("\n=== INDEPENDENT LAG BY REGIME (all regimes) ===")
+print(lag_by_regime_all)
+
+# ---------- 9d. Storm-period lag ----------------------------------------------
+lag_data_storm <- lag_data %>%
+  mutate(storm_period = case_when(
+    noaa_dt >= pre_storm_start & noaa_dt < STORM_START  ~ "Pre-storm",
+    noaa_dt >= STORM_START     & noaa_dt < STORM_END    ~ "Storm",
+    noaa_dt >= STORM_END       & noaa_dt < STORM_END + days(7) ~ "Post-storm (1 wk)",
+    TRUE ~ "Other")) %>%
+  filter(storm_period != "Other")
+
+lag_storm_summary <- lag_data_storm %>%
+  group_by(storm_period, noaa_type) %>%
+  summarise(n = n(),
+            mean_lag = round(mean(ind_lag_min), 1),
+            sd_lag   = round(sd(ind_lag_min), 1),
+            .groups = "drop") %>%
+  mutate(storm_period = factor(storm_period,
+                               levels = c("Pre-storm", "Storm", "Post-storm (1 wk)"))) %>%
+  arrange(storm_period, noaa_type) %>%
+  rename(tide_type = noaa_type)
+
+message("\n=== INDEPENDENT LAG BY STORM PERIOD (minutes) ===")
+print(lag_storm_summary)
+```
+```{r}
+lag_data %>%
+  group_by(noaa_type, tidal_regime) %>%
+  summarise(
+    n              = n(),
+    max_lag        = round(max(ind_lag_min), 1),
+    n_at_175plus   = sum(ind_lag_min >= 175),
+    n_at_179plus   = sum(ind_lag_min >= 179),
+    .groups = "drop"
+  ) %>%
+  arrange(noaa_type, tidal_regime)
+```
+
+---
+
+## 10. Sampling-window tide stage summary
+
+```{r sampling-stage-table}
+stage_table <- tidal_stage_results %>%
+  mutate(
+    Sampling_Date   = format(Date_parsed, "%b %d, %Y"),
+    Window_HST      = paste0(format(start_dt, "%H:%M"), "\u2013",
+                             format(assess_end_dt, "%H:%M")),
+    Window_Duration = sprintf("%.0f min",
+                              as.numeric(difftime(assess_end_dt, start_dt, units = "mins"))),
+    Window_Type     = window_flag
+  ) %>%
+  select(Sampling_Date, Window_HST, Window_Duration, Window_Type,
+         Tide_Stage_Majority, Tide_Switching, Tide_Stage_Split,
+         tidal_regime, moon_phase_name) %>%
+  rename(`Majority Tide Stage` = Tide_Stage_Majority,
+         `Stage Switching`     = Tide_Switching,
+         `Stage Detail`        = Tide_Stage_Split,
+         `Tidal Regime`        = tidal_regime,
+         `Moon Phase`          = moon_phase_name)
+
+message("\n=== SUPPLEMENTARY TABLE: SAMPLING WINDOW TIDAL CONDITIONS ===\n")
+print(stage_table, n = 20)
+
+stage_freq <- tidal_stage_results %>%
+  filter(!is.na(Tide_Stage_Majority)) %>%
+  count(Tide_Stage_Majority, name = "n_events") %>%
+  mutate(pct = round(100 * n_events / sum(n_events), 1)) %>%
+  arrange(desc(n_events))
+
+message("\n=== TIDE STAGE FREQUENCY ===")
+print(stage_freq)
+
+regime_freq <- tidal_stage_results %>%
+  filter(!is.na(tidal_regime)) %>%
+  count(tidal_regime, name = "n_events") %>%
+  mutate(pct = round(100 * n_events / sum(n_events), 1)) %>%
+  arrange(desc(n_events))
+
+message("\n=== TIDAL REGIME FREQUENCY ===")
+print(regime_freq)
+```
+
+---
+
+## 11. Save all outputs
+```{r save-outputs}
+write_csv(local_extrema_full,  file.path(output_path, "local_ctd_extrema.csv"))
+write_csv(tidal_stage_results, file.path(output_path, "tidal_stage_summary.csv"))
+write_csv(samples_with_stage,  file.path(output_path, "samples_with_tidal_stage.csv"))
+write_csv(ctd_dates,           file.path(output_path, "moon_phase_tidal_regime.csv"))
+write_csv(tidal_ranges,        file.path(output_path, "tidal_ranges_by_halfcycle.csv"))
+write_csv(lag_data,            file.path(output_path, "lag_data_full.csv"))
+write_csv(as.data.frame(stage_table),
+          file.path(output_path, "tidal_conditions_summary.csv"))
+
+message("\nFiles written to: ", output_path)
+```
+
+---
+
+## 12. Exploratory gap analyses
+
+Six aspects of fishpond tidal dynamics not yet covered in Sections 8–11. Each
+subsection produces diagnostic plots and summary tables; promote any to Figure
+S1 / Table S3 if results merit. Computed here so that all subsequent sections
+can optionally use these objects, and so a single knit produces every output.
+
+```{r gap-setup}
+# ── He"eia Fishpond geometry (Tognacchini 2015) ──
+# Surface area: ~88 acres = 356,131 m² (Methods)
+FISHPOND_AREA_M2 <- 356123
+DBAR_TO_M        <- 1.00     # at fishpond salinities (~10–26 PSU)
+
+# ── Mean tidal-cycle water column depth ──
+# Derived from Tognacchini (2015) bathymetric measurements:
+#   - Mean fishpond depth at neap low water: 0.38 m (spatial average)
+#   - Average tidal range: 0.72 m
+# Tidal-cycle mean depth = neap LW depth + half tidal range
+#                        = 0.38 + (0.72/2) = 0.74 m
+# Preferred over CTD pressure mean (~0.46 m), which only reflects water
+# column above the sensor at one location and underestimates whole-pond
+# mean depth. Tognacchini value is a spatial average across the fishpond
+# at a documented tidal phase.
+NEAP_LW_DEPTH_M    <- 0.38
+AVG_TIDAL_RANGE_M  <- 0.72
+mean_depth_m       <- NEAP_LW_DEPTH_M + (AVG_TIDAL_RANGE_M / 2)  # = 0.74 m
+mean_volume_m3     <- mean_depth_m * FISHPOND_AREA_M2
+
+# For comparison: CTD-pressure-mean depth (not used for V_mean)
+mean_pressure_dbar <- mean(ctd$pressure, na.rm = TRUE)
+ctd_depth_m        <- mean_pressure_dbar * DBAR_TO_M
+
+message(sprintf("Mean tidal-cycle depth (Tognacchini-derived): %.2f m", mean_depth_m))
+message(sprintf("CTD pressure mean (for comparison only):       %.2f m", ctd_depth_m))
+message(sprintf("Mean fishpond volume: %.0f m³ (%.2f million m³)",
+                mean_volume_m3, mean_volume_m3 / 1e6))
+```
+
+### 12.1 Half-cycle data (shared by Sections 12.1–12.4)
+
+Pair consecutive extrema from `local_extrema_full`, attach `tidal_regime` and
+`moon_phase_name` from `ctd_dates` by date.
+
+```{r gap-half-cycle}
+# Pairs consecutive extrema from local_extrema_full to build half-cycles. No
+# constituent-classification filter applied: requiring both endpoints to be
+# Major produces an unrepresentative subset (cases where the intervening
+# minor extremum was missed by detection). All detected half-cycles accepted;
+# duration (3–18 h) and amplitude (>0.05 m excursion) filters drop physically
+# implausible or noise-dominated pairs. Mākāhā"s strong filtering of the
+# minor constituent ensures the major-cycle signal dominates regardless.
+
+half_cycle <- local_extrema_full %>%
+  arrange(local_dt) %>%
+  mutate(
+    next_p   = lead(local_p),
+    next_t   = lead(local_dt),
+    next_typ = lead(noaa_type),
+    half_cycle_hr  = as.numeric(difftime(next_t, local_dt, units = "hours")),
+    excursion_m    = abs(next_p - local_p) * DBAR_TO_M,
+    tidal_prism_m3 = excursion_m * FISHPOND_AREA_M2,
+    direction      = case_when(
+      noaa_type == "L" & next_typ == "H" ~ "Rising",
+      noaa_type == "H" & next_typ == "L" ~ "Falling",
+      TRUE                               ~ NA_character_
+    ),
+    residence_hr = (mean_volume_m3 / tidal_prism_m3) * half_cycle_hr,
+    residence_d  = residence_hr / 24,
+    # Use the half-cycle midpoint to assign storm period
+    midpoint_dt  = local_dt + (next_t - local_dt) / 2,
+    period       = case_when(
+      midpoint_dt >= pre_storm_start & midpoint_dt < STORM_START ~ "Pre-storm",
+      midpoint_dt >= STORM_START     & midpoint_dt < STORM_END   ~ "Storm",
+      midpoint_dt >= STORM_END       & midpoint_dt <  STORM_END + days(POST_STORM_DAYS) ~ "Post-storm",
+      TRUE                                                       ~ "Outside"
+    )
+  ) %>%
+  filter(!is.na(direction),
+         half_cycle_hr > 3, half_cycle_hr < 18,
+         excursion_m   > 0.05) %>%
+  mutate(date = as.Date(local_dt)) %>%
+  left_join(ctd_dates %>% select(date, tidal_regime, moon_phase_name),
+            by = "date") %>%
+  select(-date)
+
+message(sprintf("Half-cycles built: %d (after filtering)", nrow(half_cycle)))
+message("Half-cycles by period:")
+print(half_cycle %>% count(period))
+```
+
+### 12.2 Residence time / flushing time
+
+Tidal-prism approximation: τ = (V_mean / P_halfcycle) × T_halfcycle, where
+V_mean is mean fishpond volume, P is tidal prism per half-cycle, T is the
+half-cycle period. This is a **lower-bound** estimate that assumes complete
+mixing and complete prism exchange each cycle. Real residence times in
+restricted basins are typically 2–5× longer due to incomplete mixing
+("return-flow factor" or "exchange ratio" ≈ 0.2–0.5). For Heʻeia
+specifically, Tognacchini (2015, citing Timmermann et al., in prep.) reports
+an empirical average HFP recovery time of ~4 days, implying an effective
+exchange ratio near 0.2 in this restricted system.
+
+Volume here uses the mean CTD pressure (~0.46 m water column above sensor)
+as a proxy for mean fishpond depth. This is a documented approximation;
+sensor placement adds ~0.06 m uncertainty.
+
+```{r gap-residence-time}
+# ── Pre-storm baseline by regime (matches Figure S1 panel context) ──
+res_summary <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  group_by(tidal_regime) %>%
+  summarise(
+    n              = n(),
+    mean_excursion = round(mean(excursion_m, na.rm = TRUE), 3),
+    mean_prism_m3  = round(mean(tidal_prism_m3, na.rm = TRUE), 0),
+    mean_res_d     = round(mean(residence_d, na.rm = TRUE), 2),
+    median_res_d   = round(median(residence_d, na.rm = TRUE), 2),
+    sd_res_d       = round(sd(residence_d, na.rm = TRUE), 2),
+    min_res_d      = round(min(residence_d, na.rm = TRUE), 2),
+    max_res_d      = round(max(residence_d, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+message("\n=== RESIDENCE TIME BY REGIME (all periods combined) ===")
+print(res_summary)
+
+# ── By regime × period (informative for storm/post-storm comparison) ──
+res_by_period <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap"),
+         period %in% c("Pre-storm", "Storm", "Post-storm")) %>%
+  group_by(period, tidal_regime) %>%
+  summarise(
+    n            = n(),
+    mean_res_d   = round(mean(residence_d, na.rm = TRUE), 2),
+    median_res_d = round(median(residence_d, na.rm = TRUE), 2),
+    sd_res_d     = round(sd(residence_d, na.rm = TRUE), 2),
+    min_res_d    = round(min(residence_d, na.rm = TRUE), 2),
+    max_res_d    = round(max(residence_d, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  mutate(period = factor(period, levels = c("Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(period, tidal_regime)
+message("\n=== RESIDENCE TIME BY PERIOD × REGIME ===")
+print(res_by_period)
+
+# ── By period only (n in storm is small; useful as a sense check) ──
+res_by_period_only <- half_cycle %>%
+  filter(period %in% c("Pre-storm", "Storm", "Post-storm")) %>%
+  group_by(period) %>%
+  summarise(
+    n            = n(),
+    mean_res_d   = round(mean(residence_d, na.rm = TRUE), 2),
+    median_res_d = round(median(residence_d, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  mutate(period = factor(period, levels = c("Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(period)
+message("\n=== RESIDENCE TIME BY PERIOD (overall) ===")
+print(res_by_period_only)
+
+# ── Diagnostic boxplot: residence time by regime (regime-only) ──
+# Exploratory view; the publication-quality Figure S1 Panel F equivalent
+# is built in build-residence-boxplot below (object p_residence).
+p_residence_diag <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  mutate(tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap"))) %>%
+  ggplot(aes(tidal_regime, residence_d, fill = tidal_regime)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1.5) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1) +
+  scale_fill_brewer(palette = "Blues", guide = "none") +
+  labs(title = "Residence time by tidal regime (diagnostic)",
+       subtitle = "Tidal-prism estimate; lower bound (complete-mixing assumption)",
+       x = "Tidal regime", y = "Residence time (days)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+print(p_residence_diag)
+
+# ── Time-series: residence per cycle through record, with storm shading ──
+# Shows storm/post-storm dynamics that the boxplot collapses across.
+p_residence_ts <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap"),
+         midpoint_dt >= pre_storm_start,
+         midpoint_dt <  STORM_END + days(POST_STORM_DAYS)) %>%
+  mutate(tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap"))) %>%
+  ggplot(aes(midpoint_dt, residence_d)) +
+  annotate("rect", xmin = as_datetime(STORM_START), xmax = as_datetime(STORM_END),
+           ymin = -Inf, ymax = Inf, fill = "#dfdfdf", alpha = 0.5) +
+  annotate("text", x = as_datetime(STORM_START) + hours(36), y = Inf,
+           label = "Storm Wali", vjust = 1.3, size = 3,
+           color = "black", fontface = "italic") +
+  geom_point(aes(color = tidal_regime), size = 2, alpha = 0.8) +
+  geom_line(color = "grey60", alpha = 0.4, linewidth = 0.3) +
+  scale_color_manual(values = c("Spring" = "#1F4E79",
+                                "Neap" = "#C6DBEF")) +
+  scale_x_datetime(date_labels = "%b %d", date_breaks = "3 days",
+                   limits = c(as_datetime(pre_storm_start),
+                              as_datetime(STORM_END + days(POST_STORM_DAYS))),
+                   expand = expansion(mult = 0.01)) +
+  labs(title = "Residence time per half-cycle through the record",
+       subtitle = "Storm period shaded; colored by tidal regime",
+       x = NULL, y = "Residence time (days)", color = "Regime") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+print(p_residence_ts)
+```
+
+### 12.3 Tidal prism per regime
+
+Volume of water exchanged per half-cycle. **Caveat on direction asymmetry:**
+the flooding vs. ebbing counts are unbalanced (more ebbs than floods detected
+in some regimes), likely because the `excursion_m > 0.05` filter drops more
+short half-cycles in one direction than the other. This makes the
+flood-vs-ebb *prism* comparison unreliable. The flux-rate asymmetry (Section
+12.4) covers the same physics on firmer methodological ground. Total prism
+by regime (regardless of direction) is the more interpretable quantity here.
+
+```{r gap-tidal-prism}
+prism_summary <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  group_by(tidal_regime, direction) %>%
+  summarise(
+    n              = n(),
+    mean_prism_m3  = round(mean(tidal_prism_m3, na.rm = TRUE), 0),
+    sd_prism_m3    = round(sd(tidal_prism_m3, na.rm = TRUE), 0),
+    .groups = "drop"
+  )
+message("\n=== TIDAL PRISM BY REGIME × DIRECTION ===")
+print(prism_summary)
+
+p_prism <- half_cycle %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  mutate(tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap"))) %>%
+  ggplot(aes(tidal_regime, tidal_prism_m3 / 1000, fill = direction)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c("Rising" = "#5B9BD5", "Falling" = "#ED7D31")) +
+  labs(title = "Tidal prism by regime and flow direction",
+       x = "Tidal regime",
+       y = expression("Tidal prism (×10"^3*" m"^3*")"),
+       fill = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+print(p_prism)
+```
+
+### 12.4 Asymmetric flux (rise rate vs. fall rate)
+
+Mean pressure change rate per half-cycle, comparing flooding to ebbing within
+each regime. Flood/ebb ratio > 1 means filling faster than draining.
+
+```{r gap-asymmetric-flux}
+flux_data <- half_cycle %>%
+  mutate(
+    flux_rate_dbar_per_hr = (next_p - local_p) / half_cycle_hr,
+    abs_flux_dbar_per_hr  = abs(flux_rate_dbar_per_hr)
+  )
+
+flux_summary <- flux_data %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  group_by(tidal_regime, direction) %>%
+  summarise(
+    n           = n(),
+    mean_rate   = round(mean(abs_flux_dbar_per_hr, na.rm = TRUE), 4),
+    sd_rate     = round(sd(abs_flux_dbar_per_hr,   na.rm = TRUE), 4),
+    median_rate = round(median(abs_flux_dbar_per_hr, na.rm = TRUE), 4),
+    min_rate    = round(min(abs_flux_dbar_per_hr,    na.rm = TRUE), 4),
+    max_rate    = round(max(abs_flux_dbar_per_hr,    na.rm = TRUE), 4),
+    .groups = "drop"
+  ) %>%
+  arrange(tidal_regime, direction)
+message("\n=== ASYMMETRIC FLUX BY REGIME × DIRECTION ===")
+print(flux_summary)
+
+flood_ebb_test <- flux_data %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  group_by(tidal_regime) %>%
+  summarise(
+    n_rising    = sum(direction == "Rising"),
+    n_falling   = sum(direction == "Falling"),
+    rising_mean   = round(mean(abs_flux_dbar_per_hr[direction == "Rising"],
+                               na.rm = TRUE), 4),
+    falling_mean  = round(mean(abs_flux_dbar_per_hr[direction == "Falling"],
+                               na.rm = TRUE), 4),
+    rising_median  = round(median(abs_flux_dbar_per_hr[direction == "Rising"],
+                                  na.rm = TRUE), 4),
+    falling_median = round(median(abs_flux_dbar_per_hr[direction == "Falling"],
+                                  na.rm = TRUE), 4),
+    asymmetry_ratio = round(rising_mean / falling_mean, 2),
+    # Wilcoxon rank-sum test: extract W statistic and p-value together
+    W_statistic = tryCatch(
+      unname(wilcox.test(
+        abs_flux_dbar_per_hr[direction == "Rising"],
+        abs_flux_dbar_per_hr[direction == "Falling"]
+      )$statistic),
+      error = function(e) NA_real_
+    ),
+    p_value = tryCatch(
+      wilcox.test(
+        abs_flux_dbar_per_hr[direction == "Rising"],
+        abs_flux_dbar_per_hr[direction == "Falling"]
+      )$p.value,
+      error = function(e) NA_real_
+    ),
+    # Rank-biserial correlation effect size: r_rb = 2W/(n1·n2) - 1
+    # Range [-1, +1]; positive = Rising tends larger than Falling
+    effect_size_rrb = round(
+      2 * W_statistic / (n_rising * n_falling) - 1, 3
+    ),
+    .groups = "drop"
+  )
+message("\n=== FLOOD vs EBB ASYMMETRY TEST ===")
+print(flood_ebb_test)
+
+p_flux <- flux_data %>%
+  filter(!is.na(tidal_regime),
+         tidal_regime %in% c("Spring", "Neap")) %>%
+  mutate(tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap")),
+         direction    = factor(direction,
+                               levels = c("Rising", "Falling"))) %>%
+  ggplot(aes(direction, abs_flux_dbar_per_hr, fill = tidal_regime)) +
+  stat_boxplot(geom = "errorbar", width = 0.3,
+               position = position_dodge(width = 0.7),
+               color = "black", linewidth = 0.5) +
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7),
+               color = "black", linewidth = 0.5, outlier.size = 1.2,
+               outlier.color = "black") +
+  scale_fill_manual(values = c("Spring" = "#3288BD",   # Spectral blue (stronger forcing)
+                               "Neap"   = "#9ECAE1"),  # Lightened (weaker forcing)
+                    name = "Tidal regime") +
+  labs(x = "Flow direction",
+       y = "Tidal flow rate\n(dbar hr⁻¹)") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "bottom",
+        plot.margin = margin(t = 6, r = 6, b = 4, l = 6))
+print(p_flux)
+```
+
+
+---
+
+## 13. Supplementary Table S3: Tidal dynamics summary
+
+```{r supp-table-s3}
+# ══════════════════════════════════════════════════════════════════
+# Supplementary Table S3: Tidal dynamics at He"eia Fishpond
+# Panel A: Tidal propagation lag by tide type and regime
+# Panel B: Asymmetric tidal flux (flooding vs. ebbing) by regime
+# Panel C: Storm Wali disruption of tidal dynamics
+# Panel D: Tidal residence time estimates by regime (optional)
+# ══════════════════════════════════════════════════════════════════
+
+# ── Panel A: Tidal propagation lag by tide type and regime ──
+# Rows grouped by Regime first (Spring, Neap, All), then by Tide within
+# each regime. "All" row in the Regime column represents lag values pooled
+# across regimes (Spring + Neap data combined) for each tide type.
+panel_a_lag <- lag_by_regime %>%
+  mutate(
+    Tide = ifelse(tide_type == "H", "High (HHT + LHT)", "Low (LLT + HLT)"),
+    Mean_SD = paste0(mean_lag, " ± ", sd_lag),
+    Range = paste0(min_lag, "–", max_lag)
+  ) %>%
+  select(tidal_regime, Tide, n, Mean_SD, median_lag, Range) %>%
+  rename(Regime = tidal_regime, Median = median_lag)
+
+panel_a_all <- lag_overall %>%
+  mutate(
+    Tide = ifelse(tide_type == "H", "High (HHT + LHT)", "Low (LLT + HLT)"),
+    Regime = "All",
+    Mean_SD = paste0(mean_lag, " ± ", sd_lag),
+    Range = paste0(min_lag, "–", max_lag)
+  ) %>%
+  select(Regime, Tide, n, Mean_SD, median_lag, Range) %>%
+  rename(Median = median_lag)
+
+panel_a <- bind_rows(panel_a_lag, panel_a_all) %>%
+  mutate(
+    Regime = factor(Regime, levels = c("Spring", "Neap", "All")),
+    Tide   = factor(Tide,
+                    levels = c("High (HHT + LHT)", "Low (LLT + HLT)"))
+  ) %>%
+  arrange(Regime, Tide)
+
+message("\n=== TABLE S3 PANEL A: TIDAL PROPAGATION LAG ===")
+print(panel_a)
+
+# ── Panel B: Asymmetric tidal flux by regime ──
+# Combined display: per-direction stats (n, Mean ± SD, Median, Range) with
+# regime-level Wilcoxon results (Rise:Fall Ratio, W, p, effect size r_rb)
+# populated only on the Rising row of each regime to avoid duplication.
+# ── Panel B: Asymmetric tidal flux by regime ──
+# Rising vs falling pressure change rates per half-cycle. Uniform 6-column
+# layout (Regime, Direction, n, Mean_SD, Median, Range) matching Panels A,
+# C, D. Wilcoxon test results (W, p, effect size r_rb) computed separately
+# in flood_ebb_test and reported in Section 13b.
+panel_b <- flux_summary %>%
+  mutate(
+    Direction = direction,
+    Mean_SD   = paste0(mean_rate, " ± ", sd_rate),
+    Range     = paste0(min_rate, "–", max_rate)
+  ) %>%
+  select(tidal_regime, Direction, n, Mean_SD, median_rate, Range) %>%
+  rename(Regime = tidal_regime, Median = median_rate) %>%
+  mutate(Regime = factor(Regime, levels = c("Spring", "Neap"))) %>%
+  arrange(Regime, Direction)
+
+message("\n=== TABLE S3 PANEL B: ASYMMETRIC TIDAL FLUX (rising vs. falling) ===")
+print(panel_b)
+
+# ── Panel C: Storm Wali disruption of tidal dynamics ──
+# Long format: rows are (Metric × Period); columns are n / Mean_SD / Median /
+# Range. Metric ordering: continuous mean water level first (whole-record
+# context), then discrete tidal extrema (HHT then LLT), then the derived
+# tidal excursion. All values reported in dbar.
+
+panel_c_mean_wl <- mean_wl_by_period %>%
+  transmute(
+    Metric  = "Total mean water level",
+    Period  = period,
+    n       = n_obs,
+    Mean_SD = paste0(mean_pressure_dbar, " ± ", sd_pressure_dbar),
+    Median  = median_pressure_dbar,
+    Range   = paste0(min_pressure_dbar, "–", max_pressure_dbar)
+  )
+
+panel_c_hht <- hw_lw_summary %>%
+  filter(noaa_type == "H") %>%
+  transmute(
+    Metric  = "HHT water level",
+    Period  = period,
+    n       = n,
+    Mean_SD = paste0(mean_wl, " ± ", sd_wl),
+    Median  = median_wl,
+    Range   = paste0(min_wl, "–", max_wl)
+  )
+
+panel_c_llt <- hw_lw_summary %>%
+  filter(noaa_type == "L") %>%
+  transmute(
+    Metric  = "LLT water level",
+    Period  = period,
+    n       = n,
+    Mean_SD = paste0(mean_wl, " ± ", sd_wl),
+    Median  = median_wl,
+    Range   = paste0(min_wl, "–", max_wl)
+  )
+
+panel_c_excursion <- excursion_per_cycle %>%
+  transmute(
+    Metric  = "Tidal excursion (HHT − LLT)",
+    Period  = period,
+    n       = n_cycles,
+    Mean_SD = paste0(excursion_mean, " ± ", excursion_sd),
+    Median  = excursion_median,
+    Range   = paste0(excursion_min, "–", excursion_max)
+  )
+
+panel_c <- bind_rows(
+  panel_c_mean_wl,
+  panel_c_hht,
+  panel_c_llt,
+  panel_c_excursion
+) %>%
+  mutate(
+    Metric = factor(Metric, levels = c("Total mean water level",
+                                       "HHT water level",
+                                       "LLT water level",
+                                       "Tidal excursion (HHT − LLT)")),
+    Period = factor(Period, levels = c("Pre-storm", "Storm", "Post-storm"))
+  ) %>%
+  arrange(Metric, Period)
+
+message("\n=== TABLE S3 PANEL C: STORM WALI DISRUPTION ===")
+print(panel_c)
+
+# ── Panel D: Residence time estimates by regime and storm period ──
+# Geometric tidal-prism estimates from Section 12.2. Rows grouped first by
+# Regime, then by Period: "All" (pooled across full deployment) followed by
+# storm-window stratification (Pre-storm, Storm, Post-storm).
+panel_d_regime <- res_summary %>%
+  mutate(
+    Regime   = factor(tidal_regime, levels = c("Spring", "Neap")),
+    Period   = "All",
+    Mean_SD  = paste0(mean_res_d, " ± ", sd_res_d),
+    Range    = paste0(min_res_d, "–", max_res_d)
+  ) %>%
+  select(Regime, Period, n, Mean_SD, median_res_d, Range) %>%
+  rename(Median = median_res_d)
+
+panel_d_period_regime <- res_by_period %>%
+  mutate(
+    Regime  = factor(tidal_regime, levels = c("Spring", "Neap")),
+    Period  = factor(period, levels = c("Pre-storm", "Storm", "Post-storm")),
+    Mean_SD = paste0(mean_res_d, " ± ", sd_res_d),
+    Range   = paste0(min_res_d, "–", max_res_d)
+  ) %>%
+  select(Regime, Period, n, Mean_SD, median_res_d, Range) %>%
+  rename(Median = median_res_d)
+
+# Merge "All" (Regime-only) and period-stratified rows, with Period ordering:
+# All first, then Pre-storm → Storm → Post-storm. Group by Regime in output.
+panel_d <- bind_rows(panel_d_regime, panel_d_period_regime) %>%
+  mutate(Period = factor(Period,
+                         levels = c("All", "Pre-storm", "Storm", "Post-storm"))) %>%
+  arrange(Regime, Period)
+
+message("\n=== TABLE S3 PANEL D: RESIDENCE TIME ESTIMATES (days) ===")
+print(panel_d)
+
+# ── Save all panels ──
+# One CSV per sub-panel, content-descriptive filenames (decoupled from
+# manuscript table numbering). write_excel_csv adds a UTF-8 BOM so Excel
+# renders em-dashes, ±, and en-dashes correctly on both Mac and Windows.
+# Statistical test results are computed and reported in Section 13b
+# (Statistical tests); only descriptive summaries are written to CSV.
+
+manuscript_output_path <- "/Users/becca/Documents/current projects/Manuscript Storm Wali/output/table_supp3_tidal_dynamics"
+
+write_excel_csv(panel_a, file.path(manuscript_output_path, "tidal_lag_summary.csv"))
+write_excel_csv(panel_b, file.path(manuscript_output_path, "tidal_flux_summary.csv"))
+write_excel_csv(panel_c, file.path(manuscript_output_path, "storm_disruption_summary.csv"))
+write_excel_csv(panel_d, file.path(manuscript_output_path, "residence_time_summary.csv"))
+
+message("\nTable S3 panels saved to: ", manuscript_output_path)
+```
+
+---
+
+## 13b. Statistical tests
+
+Three tests answer the manuscript"s load-bearing statistical questions. Test
+results print to the console only; descriptive summaries are in Table S3 and
+test results are integrated into the supplementary text (Section 15).
+
+Tests:
+  1. Panel B Wilcoxon rank-sum (Spring): Rising vs Falling flow rates
+  2. Panel B Wilcoxon rank-sum (Neap):  Rising vs Falling flow rates
+  3. Panel D Gamma GLM + LRT: storm period effect on residence time,
+     controlling for tidal regime
+
+```{r statistical-tests}
+# ══════════════════════════════════════════════════════════════════
+# Test 1 & 2: Wilcoxon rank-sum for Rising vs Falling flow rates
+# Already computed in flood_ebb_test (Section 12.4); print results here.
+# ══════════════════════════════════════════════════════════════════
+
+message("\n══════════════════════════════════════════════════════════════════")
+message("STATISTICAL TESTS — Table S3 / Figure S1 supporting tests")
+message("══════════════════════════════════════════════════════════════════")
+
+message("\n── Tests 1 & 2: Rising vs Falling flow rate asymmetry (Wilcoxon) ──")
+flood_ebb_test %>%
+  transmute(
+    Regime          = tidal_regime,
+    n_Rising        = n_rising,
+    n_Falling       = n_falling,
+    Rising_mean     = rising_mean,
+    Falling_mean    = falling_mean,
+    Rise_Fall_Ratio = asymmetry_ratio,
+    W_statistic     = W_statistic,
+    p_value         = vapply(p_value,
+                             function(p) if (is.na(p)) NA_character_
+                                         else if (p < 0.0001) "<0.0001"
+                                         else formatC(p, format = "f", digits = 4),
+                             character(1)),
+    Effect_size_rrb = effect_size_rrb
+  ) %>%
+  print()
+message("Interpretation: rank-biserial effect size r_rb in [-1, +1];")
+message("  |r_rb| >= 0.5 = large effect, ~0.3 = medium, ~0.1 = small.")
+message("  Positive r_rb means Rising rates exceed Falling rates.")
+
+# ══════════════════════════════════════════════════════════════════
+# Test 3: Storm period effect on residence time
+# Gamma GLM with log link (appropriate for positive right-skewed time data).
+# Pools Spring + Neap half-cycles; regime confound handled via the regime
+# covariate in the full model.
+#
+# Nested model comparisons:
+#   - Period effect, controlling for regime: m(regime) vs m(regime + period)
+#   - Regime effect, controlling for period: m(period) vs m(regime + period)
+#
+# The Spring x Storm cell is empty (n = 0; the storm coincided with Neap),
+# so the regime x period interaction model cannot be estimated and only
+# the additive structure is tested.
+# ══════════════════════════════════════════════════════════════════
+
+message("\n── Test 3: Storm period effect on residence time (Gamma GLM + LRT) ──")
+
+lrt_data <- half_cycle %>%
+  filter(period %in% c("Pre-storm", "Storm", "Post-storm"),
+         tidal_regime %in% c("Spring", "Neap"),
+         !is.na(residence_d), residence_d > 0) %>%
+  mutate(period       = factor(period,       levels = c("Pre-storm", "Storm", "Post-storm")),
+         tidal_regime = factor(tidal_regime, levels = c("Spring", "Neap")))
+
+# Nested Gamma GLMs
+m_regime_only <- glm(residence_d ~ tidal_regime,
+                     family = Gamma(link = "log"), data = lrt_data)
+m_period_only <- glm(residence_d ~ period,
+                     family = Gamma(link = "log"), data = lrt_data)
+m_additive    <- glm(residence_d ~ tidal_regime + period,
+                     family = Gamma(link = "log"), data = lrt_data)
+
+# LRTs
+lrt_period <- anova(m_regime_only, m_additive, test = "LRT")
+lrt_regime <- anova(m_period_only, m_additive, test = "LRT")
+
+# Multiplicative effects (back-transformed from log link) + 95% CIs
+coef_table <- tibble(
+  Term  = names(coef(m_additive)),
+  log_estimate = coef(m_additive),
+  log_lower = suppressMessages(confint(m_additive))[, 1],
+  log_upper = suppressMessages(confint(m_additive))[, 2]
+) %>%
+  mutate(
+    Multiplicative_effect = round(exp(log_estimate), 3),
+    CI_95_lower           = round(exp(log_lower),   3),
+    CI_95_upper           = round(exp(log_upper),   3)
+  ) %>%
+  filter(grepl("^period|^tidal_regime", Term)) %>%
+  select(Term, Multiplicative_effect, CI_95_lower, CI_95_upper)
+
+# Console summary
+lrt_summary <- tibble(
+  Test        = c("Period effect (controlling for regime)",
+                  "Regime effect (controlling for period)"),
+  df          = c(lrt_period$Df[2], lrt_regime$Df[2]),
+  Chi_squared = round(c(lrt_period$Deviance[2], lrt_regime$Deviance[2]), 2),
+  p_value     = vapply(
+    c(lrt_period$`Pr(>Chi)`[2], lrt_regime$`Pr(>Chi)`[2]),
+    function(p) if (is.na(p)) NA_character_
+                else if (p < 0.0001) "<0.0001"
+                else formatC(p, format = "f", digits = 4),
+    character(1)
+  ),
+  Model = "Gamma GLM, log link"
+)
+
+print(lrt_summary)
+message("\nMultiplicative effects (back-transformed from log scale) with 95% CIs:")
+print(coef_table)
+message("\nInterpretation:")
+message("  - periodStorm:     Storm-period residence vs Pre-storm, controlling for regime")
+message("  - periodPost-storm: Post-storm residence vs Pre-storm, controlling for regime")
+message("  - tidal_regimeNeap: Neap residence vs Spring, controlling for period")
+message("  Values > 1 indicate extension of residence time. CIs that include 1")
+message("  indicate the effect is not significantly different from no effect.")
+message("\n══════════════════════════════════════════════════════════════════\n")
+```
+
+---
+
+## 14. Publication-quality supplemental figures
+
+Figure S1 is assembled in the final chunk (`fig-s1-combined`) from five
+panel inputs across three rows:
+
+- **Panel A (Row 1, full width):** `p_C_storm` — CTD + NOAA pressure traces; built in `build-storm-traces` below
+- **Panel B (Row 2, full width):** `p_D_detided` — storm-driven water level anomaly; built in `build-detided-anomaly` below
+- **Panel C (Row 3, left):** `p_lag_major` — propagation lag boxplot; built in `build-lag-boxplot` above
+- **Panel D (Row 3, middle):** `p_flux` — asymmetric flux boxplot; built upstream in Section 12.4 (`gap-asymmetric-flux`)
+- **Panel E (Row 3, right):** `p_residence` — residence time boxplot; built in `build-residence-boxplot` above
+
+Row 3 panels share a single fill aesthetic (tidal regime: Spring / Neap)
+in a two-tone blue palette; patchwork collects them into one shared legend
+placed at the right of the row via `guide_area()`. Panel widths within
+Row 3 are 4 : 4 : 6 : 4 (lag : flux : residence : legend area) — each
+x-axis category gets the same horizontal space across panels (2 width-units
+per category: lag and flux have two categories each, residence has three).
+This keeps the rendered box widths visually consistent across all three
+panels.
+
+Intermediate panel objects below carry no letter prefix; the assembly
+chunk applies the final panel letters via `plot_annotation(tag_levels = ...)`.
+
+```{r build-lag-boxplot, fig.width=8, fig.height=5, dpi=300}
+# Builds p_lag_major — lag boxplot panel in Figure S1 row 3 (left).
+# Boxplots of independent CTD/NOAA propagation lag, x-axis = tide type
+# (High / Low), fill = tidal regime (Spring / Neap). Two-tone blue palette
+# unifies the regime aesthetic with the flux and residence boxplots.
+#
+# Filter to Spring/Neap BEFORE factoring: lag_data carries Intermediate
+# regime rows too; without the filter, factor() coerces them to NA and
+# ggplot renders an extra grey "NA" boxplot group with NA in the legend.
+# The flux and residence panels filter identically (Sections 12.4 and
+# build-residence-boxplot respectively) — this matches that pattern.
+lag_plot_major <- lag_data %>%
+  filter(tidal_regime %in% c("Spring", "Neap")) %>%
+  mutate(tide_label   = factor(if_else(noaa_type == "H", "High", "Low"),
+                               levels = c("High", "Low")),
+         tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap")))
+
+p_lag_major <- ggplot(lag_plot_major,
+                      aes(x = tide_label, y = ind_lag_min, fill = tidal_regime)) +
+  stat_boxplot(geom = "errorbar", width = 0.3,
+               position = position_dodge(width = 0.7),
+               color = "black", linewidth = 0.5) +
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7),
+               color = "black", linewidth = 0.5, outlier.size = 1.2,
+               outlier.color = "black") +
+  scale_fill_manual(values = c("Spring" = "#3288BD",   # Spectral blue (stronger forcing)
+                               "Neap"   = "#9ECAE1"),  # Lightened (weaker forcing)
+                    name = "Tidal regime") +
+  labs(x = "Tide type", y = "Tidal propagation lag\n(minutes)") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "bottom",
+        plot.margin = margin(t = 6, r = 6, b = 4, l = 6))
+
+print(p_lag_major)
+```
+
+```{r build-residence-boxplot, fig.width=8, fig.height=5, dpi=300}
+# Builds p_residence — Figure S1 Panel F (fig-s1-combined assembly).
+# Boxplots of geometric tidal residence time per half-cycle, x-axis = storm
+# phase (Pre-storm / Storm / Post-storm), fill = tidal regime (Spring /
+# Neap). Uses position_dodge2(preserve = "single") so box widths remain
+# consistent across the empty Spring × Storm cell (the storm coincided
+# with the Neap regime, so no Spring data exist in the storm window).
+residence_plot_data <- half_cycle %>%
+  filter(period %in% c("Pre-storm", "Storm", "Post-storm"),
+         tidal_regime %in% c("Spring", "Neap"),
+         !is.na(residence_d), residence_d > 0) %>%
+  mutate(period       = factor(period,
+                               levels = c("Pre-storm", "Storm", "Post-storm")),
+         tidal_regime = factor(tidal_regime,
+                               levels = c("Spring", "Neap")))
+
+p_residence <- ggplot(residence_plot_data,
+                      aes(x = period, y = residence_d, fill = tidal_regime)) +
+  stat_boxplot(geom = "errorbar", width = 0.6,
+               position = position_dodge2(width = 0.7, preserve = "single"),
+               color = "black", linewidth = 0.5) +
+  geom_boxplot(width = 0.6,
+               position = position_dodge2(width = 0.7, preserve = "single"),
+               color = "black", linewidth = 0.5, outlier.size = 1.2,
+               outlier.color = "black") +
+  scale_fill_manual(values = c("Spring" = "#3288BD",   # Spectral blue (stronger forcing)
+                               "Neap"   = "#9ECAE1"),  # Lightened (weaker forcing)
+                    name = "Tidal regime") +
+  labs(x = "Storm phase", y = "Tidal residence time\n(days)") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "bottom",
+        plot.margin = margin(t = 6, r = 6, b = 4, l = 6))
+
+print(p_residence)
+```
+
+```{r build-storm-traces, fig.width=10, fig.height=4, dpi=300}
+# Builds p_C_storm — used as Panel A in Figure S1 (fig-s1-combined).
+# Continuous CTD + NOAA pressure traces over an expanded Fig S1 window
+# (Jul 11 – Aug 11) capturing both full moons flanking the analytical
+# pre/post-storm windows. Date range matches detided panel below for
+# stacked-panel alignment. Wider window affects only the plot; analytical
+# periods (pre-storm, storm, post-storm) remain anchored to STORM_START ±
+# PRE_STORM_DAYS / POST_STORM_DAYS as defined upstream.
+
+# ── Plotting window: bounded exactly by the two full moons ──
+# Edges coincide with the Jul 12 and Aug 10 full moons (16:25 and 08:09 HST
+# respectively). Tiny x-axis expansion (0.5%) keeps moon dashed lines just
+# inside the panel edges, visible against the y-axis line. Slightly wider
+# than the analytical calculation window (Jul 13 – Aug 6) on the right
+# (~4 days), capturing additional recovery context without affecting any
+# pre/storm/post period assignments upstream.
+fig_s1_start <- as_datetime("2014-07-11 16:25:00", tz = "Pacific/Honolulu")  # 1 day before first full moon — creates space for moon icon next to "Full" label
+fig_s1_end   <- as_datetime("2014-08-10 08:09:00", tz = "Pacific/Honolulu")
+
+ctd_plot_window <- ctd %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end)
+
+noaa_plot_window <- noaa_obs %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end) %>%
+  # Convert NOAA water level (m above MLLW datum) to dbar for direct overlay
+  # with CTD pressure. Factor 1.006 = ρ × g / 10⁴ for seawater at ~25 °C, 35 PSU
+  # (ρ ≈ 1025 kg/m³, g = 9.81 m/s², 10⁴ converts Pa to dbar). The same factor is
+  # reversed (÷ 1.006) on the panel"s secondary y-axis to display equivalent m.
+  mutate(verified_dbar = verified_m * 1.006)
+
+# ── Moon phase markers within plotting window (HST) ──
+moon_phases <- tribble(
+  ~date,                   ~label,
+  "2014-07-12 16:25:00",   "Full",
+  "2014-07-18 16:08:00",   "Last Q",
+  "2014-07-26 12:42:00",   "New",
+  "2014-08-03 14:50:00",   "First Q",
+  "2014-08-10 08:09:00",   "Full"
+) %>%
+  mutate(datetime = as_datetime(date, tz = "Pacific/Honolulu")) %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end)
+
+# Diagnostic: confirm parsing succeeded
+message("Moon phases parsed (should be 5 rows, no NA datetimes):")
+print(moon_phases)
+
+# ── Sampling event datetimes (10 discrete sampling dates) ──
+# YSI/discrete water samples from Methods. Used for tick marks above plot.
+sampling_dates <- tribble(
+  ~date_str,
+  "2014-07-07", "2014-07-09", "2014-07-14", "2014-07-16",
+  "2014-07-21", "2014-07-23", "2014-07-24", "2014-07-29",
+  "2014-07-30", "2014-08-06"
+) %>%
+  mutate(datetime = as_datetime(paste(date_str, "12:00:00"),
+                                tz = "Pacific/Honolulu")) %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end)
+
+p_C_storm <- ggplot() +
+  # Storm shading (extends back to rainfall onset on Oahu, ~18:00 HST Jul 19)
+  annotate("rect", xmin = as_datetime(STORM_SHADING_START), xmax = as_datetime(STORM_SHADING_END),
+           ymin = -Inf, ymax = Inf, fill = "#dfdfdf", alpha = 0.5) +
+  # Moon phase vertical dashed lines (darker grey, thicker for visibility)
+  geom_vline(data = moon_phases, aes(xintercept = datetime),
+             linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  # Moon phase labels in top margin (requires clip = "off" below)
+  geom_text(data = moon_phases,
+            aes(x = datetime, y = Inf, label = label),
+            vjust = -2.8, size = 5, color = "grey30", hjust = 0.5) +
+  # CTD and NOAA traces — NOAA drawn first (behind), CTD on top.
+  # Both lines solid; color and thickness distinguish them. HFP (CTD)
+  # is thicker solid black as the primary fishpond signal; NOAA bay
+  # reference is thinner solid Spectral purple behind.
+  geom_line(data = noaa_plot_window,
+            aes(x = datetime, y = verified_dbar, color = "NOAA (Moku o Loʻe)"),
+            linewidth = 0.3) +
+  geom_line(data = ctd_plot_window,
+            aes(x = datetime, y = pressure, color = "CTD (Heʻeia Fishpond)"),
+            linewidth = 0.5) +
+  # Sampling event markers (small downward triangles at panel top edge)
+  geom_point(data = sampling_dates,
+             aes(x = datetime, y = Inf),
+             shape = 25, fill = "black", color = "black",
+             size = 2, stroke = 0.35) +
+  scale_color_manual(name = NULL,
+                     values = c("CTD (Heʻeia Fishpond)" = "black",
+                                "NOAA (Moku o Loʻe)"    = "#5E4FA2")) +
+  scale_y_continuous(
+    sec.axis = sec_axis(~ . / 1.006, name = "Water level\n(m)")
+  ) +
+  scale_x_datetime(date_labels = "%b %d", date_breaks = "3 days",
+                   date_minor_breaks = "1 day",
+                   limits = c(fig_s1_start, fig_s1_end),
+                   expand = expansion(mult = 0.005)) +
+  guides(x = guide_axis(minor.ticks = TRUE)) +
+  coord_cartesian(clip = "off") +   # allow moon labels + triangles to render in top margin
+  labs(x = NULL, y = "Water level\n(dbar)") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),  # x-labels suppressed; detided panel below carries them
+        axis.ticks.x = element_blank(),
+        # Right axis (NOAA conversion to meters) styled in Spectral purple
+        axis.title.y.right = element_text(color = "#5E4FA2"),
+        axis.text.y.right  = element_text(color = "#5E4FA2"),
+        axis.line.y.right  = element_line(color = "#5E4FA2"),
+        axis.ticks.y.right = element_line(color = "#5E4FA2"),
+        plot.margin = margin(t = 38, r = 6, b = 4, l = 6))  # extra top margin for moon labels + triangles
+
+print(p_C_storm)
+```
+
+```{r build-detided-anomaly, fig.width=10, fig.height=4, dpi=300}
+# Builds p_D_detided — used as Panel B in Figure S1 (fig-s1-combined).
+# Plots two detided water level signals as anomalies from each signal"s
+# pre-storm mean: CTD (Heʻeia Fishpond, sediment-water interface) and
+# NOAA (Moku o Loʻe, MLLW reference). Each signal detided via a 25-h
+# centered running mean, then centered on its own pre-storm mean
+# (datetime < STORM_START within the analytical pre-storm window).
+#
+# Anomaly framing necessary because the two signals reference different
+# absolute baselines; subtracting pre-storm means puts them on a common
+# y-axis where storm impact is directly comparable. The contrast between
+# CTD and NOAA storm-period anomalies isolates the freshwater-driven
+# component of fishpond water level elevation from any bay-side storm
+# surge component.
+#
+# Uses the same expanded plotting window as Panel A (fig_s1_start/end,
+# defined in build-storm-traces) so the two panels stack with aligned
+# date axes.
+
+# ── CTD detided (25-h running mean) ──
+ctd_interval <- as.numeric(median(diff(ctd$datetime), units = "mins"))
+ctd_window_n <- round(25 * 60 / ctd_interval)
+
+ctd_detided <- ctd %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end) %>%
+  arrange(datetime) %>%
+  mutate(mean_wl = zoo::rollmean(pressure, k = ctd_window_n,
+                                 fill = NA, align = "center"))
+
+# ── NOAA detided (same 25-h running mean, converted to dbar) ──
+noaa_interval <- as.numeric(median(diff(noaa_obs$datetime), units = "mins"))
+noaa_window_n <- round(25 * 60 / noaa_interval)
+
+noaa_detided <- noaa_obs %>%
+  filter(datetime >= fig_s1_start, datetime <= fig_s1_end) %>%
+  arrange(datetime) %>%
+  mutate(verified_dbar = verified_m * 1.006,
+         mean_wl = zoo::rollmean(verified_dbar, k = noaa_window_n,
+                                 fill = NA, align = "center"))
+
+# ── Compute anomalies (subtract each signal"s pre-storm mean) ──
+ctd_pre_mean <- ctd_detided %>%
+  filter(datetime < STORM_START, datetime >= pre_storm_start) %>%
+  summarise(ref = mean(mean_wl, na.rm = TRUE)) %>%
+  pull(ref)
+
+noaa_pre_mean <- noaa_detided %>%
+  filter(datetime < STORM_START, datetime >= pre_storm_start) %>%
+  summarise(ref = mean(mean_wl, na.rm = TRUE)) %>%
+  pull(ref)
+
+ctd_anomaly <- ctd_detided %>%
+  mutate(anomaly = mean_wl - ctd_pre_mean, source = "CTD (Heʻeia Fishpond)")
+noaa_anomaly <- noaa_detided %>%
+  mutate(anomaly = mean_wl - noaa_pre_mean, source = "NOAA (Moku o Loʻe)")
+
+detided_combined <- bind_rows(
+  ctd_anomaly  %>% select(datetime, anomaly, source),
+  noaa_anomaly %>% select(datetime, anomaly, source)
+) %>%
+  mutate(source = factor(source,
+                         levels = c("CTD (Heʻeia Fishpond)",
+                                    "NOAA (Moku o Loʻe)")))
+
+message(sprintf("Pre-storm reference means — CTD: %.4f dbar, NOAA: %.4f dbar",
+                ctd_pre_mean, noaa_pre_mean))
+message(sprintf("Storm-period max anomaly — CTD: %.4f, NOAA: %.4f",
+                max(ctd_anomaly$anomaly[ctd_anomaly$datetime >= STORM_START &
+                                         ctd_anomaly$datetime <= STORM_END],
+                    na.rm = TRUE),
+                max(noaa_anomaly$anomaly[noaa_anomaly$datetime >= STORM_START &
+                                          noaa_anomaly$datetime <= STORM_END],
+                    na.rm = TRUE)))
+
+p_D_detided <- ggplot(detided_combined,
+                      aes(x = datetime, y = anomaly)) +
+  # Storm shading (extends back to rainfall onset on Oahu, ~18:00 HST Jul 19)
+  annotate("rect", xmin = as_datetime(STORM_SHADING_START), xmax = as_datetime(STORM_SHADING_END),
+           ymin = -Inf, ymax = Inf, fill = "#dfdfdf", alpha = 0.5) +
+  # Moon phase vertical dashed lines (lines only; labels are on Panel A above)
+  geom_vline(data = moon_phases, aes(xintercept = datetime),
+             linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  # Two geom_lines for source-specific linewidth — both solid, but
+  # NOAA bay reference rendered thinner and behind CTD (drawn first),
+  # then CTD fishpond signal rendered thicker on top.
+  geom_line(data = filter(detided_combined, source == "NOAA (Moku o Loʻe)"),
+            aes(color = source), linewidth = 0.3) +
+  geom_line(data = filter(detided_combined, source == "CTD (Heʻeia Fishpond)"),
+            aes(color = source), linewidth = 0.5) +
+  scale_color_manual(name = NULL,
+                     values = c("CTD (Heʻeia Fishpond)" = "black",
+                                "NOAA (Moku o Loʻe)"    = "#5E4FA2")) +
+  scale_y_continuous(
+    sec.axis = sec_axis(~ . / 1.006, name = "Water level anomaly\n(m, 25-hr mean)")
+  ) +
+  scale_x_datetime(date_labels = "%b %d", date_breaks = "3 days",
+                   date_minor_breaks = "1 day",
+                   limits = c(fig_s1_start, fig_s1_end),
+                   expand = expansion(mult = 0.005)) +
+  guides(x = guide_axis(minor.ticks = TRUE)) +
+  labs(x = NULL,
+       y = "Water level anomaly\n(dbar, 25-hr mean)") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "bottom",
+        # Right axis (NOAA conversion to meters) styled in Spectral purple
+        axis.title.y.right = element_text(color = "#5E4FA2"),
+        axis.text.y.right  = element_text(color = "#5E4FA2"),
+        axis.line.y.right  = element_line(color = "#5E4FA2"),
+        axis.ticks.y.right = element_line(color = "#5E4FA2"),
+        plot.margin = margin(t = 4, r = 6, b = 4, l = 6))
+
+print(p_D_detided)
+```
+
+```{r fig-s1-combined, fig.width=12, fig.height=10, dpi=300}
+# ══════════════════════════════════════════════════════════════════
+# Figure S1: Combined tidal dynamics figure (5 panels, 3 rows)
+#
+#   Row 1: Panel A — CTD + NOAA pressure traces       (full width)
+#   Row 2: Panel B — Storm-driven water level anomaly (full width)
+#   Row 3: Panel C lag | Panel D flux | Panel E residence | legend area
+#          Widths 4 : 4 : 6 : 4 (2 width-units per x-axis category;
+#          legend gets ~22% of the row)
+#
+# Row 3 panels share a single fill aesthetic (Tidal regime: Spring / Neap)
+# rendered in a two-tone blue palette, so patchwork collects one shared
+# legend placed in the rightmost guide_area().
+#
+# Panel A"s bottom axis line, ticks, and labels are suppressed so it flows
+# visually into Panel B below as a continuous time series. Panel B carries
+# x-axis ticks/date labels for both rows. Panel A"s CTD/NOAA legend is also
+# suppressed; Panel B"s legend carries the source key for both rows.
+#
+# Panels A and B share x-axis range (fig_s1_start through fig_s1_end,
+# defined in build-storm-traces: full-moon-to-full-moon Jul 11 16:25 –
+# Aug 10 08:09 HST) so storm box, moon-phase lines, and date ticks
+# align across both rows.
+#
+# Tag list explicitly skips the guide_area so panel letters remain A–E
+# (assigned in plotting order: p_A_final → A, p_D_detided → B, then
+# row3"s lag/flux/residence → C/D/E; the trailing "" suppresses any
+# tag on the legend guide_area).
+# ══════════════════════════════════════════════════════════════════
+
+# ── Panel A: hide bottom axis line + ticks, remove legend ──
+# Panel B below carries the x-axis date labels AND the CTD/NOAA
+# source legend for both panels.
+p_A_final <- p_C_storm +
+  theme(axis.line.x.bottom = element_blank(),
+        axis.ticks.x       = element_blank(),
+        legend.position    = "none")
+
+# ── Row 3 panel preparation ──
+# Remove individual legends from the lag, flux, and residence panels so
+# patchwork"s guide_area() collects a single shared "Tidal regime" legend
+# for the whole row.
+p_lag_panel       <- p_lag_major + theme(legend.position = "none")
+p_flux_panel      <- p_flux      + theme(legend.position = "none")
+p_residence_panel <- p_residence + theme(legend.position = "none")
+
+# Row 3 layout: Panels C / D / E + shared legend in guide_area().
+# Widths chosen so each x-axis category gets the same horizontal space
+# across panels (2 width-units per category): lag and flux have 2
+# categories each → width 4; residence has 3 categories → width 6.
+# This keeps the rendered box width visually consistent across all three
+# panels. The legend area gets 4 (~22% of the row). Total = 18 units.
+row3 <- p_lag_panel + p_flux_panel + p_residence_panel + guide_area() +
+  plot_layout(widths = c(4, 4, 6, 4), guides = "collect")
+
+# Full figure assembly with explicit panel letters. The tag_levels list
+# has six entries to match the six elements patchwork sees (A, B, then
+# row3"s four elements: three panels + the guide_area, which gets "" so
+# no letter prints on the legend region).
+fig_s1 <- p_A_final / p_D_detided / row3 +
+  plot_layout(heights = c(1, 1, 1)) +
+  plot_annotation(tag_levels = list(c("A", "B", "C", "D", "E", ""))) &
+  theme(plot.tag = element_text(face = "bold", size = 22, hjust = 0, vjust = 1),
+        plot.tag.position = c(0.01, 0.98),
+        axis.title = element_text(face = "bold"))
+
+print(fig_s1)
+
+ggsave(file.path(figure_path, "tidal_dynamics.pdf"),
+       fig_s1, width = 12, height = 10, dpi = 300, device = "pdf")
+```
+
+---
+
+## 15. Draft supplementary text (Methods / Results / Discussion)
+
+```{r draft-text, results="asis"}
+# ──────────────────────────────────────────────────────────────────
+# Live-value handles for use in the draft text below.
+# ──────────────────────────────────────────────────────────────────
+
+lag_maj <- lag_overall
+
+# Lag values by regime (for one-line summaries)
+lag_high_spring <- lag_by_regime %>%
+  filter(tide_type == "H", tidal_regime == "Spring")
+lag_high_neap   <- lag_by_regime %>%
+  filter(tide_type == "H", tidal_regime == "Neap")
+
+# Residence time means by regime (regime-only summary; computed in 12.2)
+res_spring  <- res_summary$mean_res_d[res_summary$tidal_regime == "Spring"]
+res_neap    <- res_summary$mean_res_d[res_summary$tidal_regime == "Neap"]
+
+# Storm-extended residence (neap, as illustrative example)
+res_neap_pre   <- res_by_period$mean_res_d[res_by_period$period == "Pre-storm"   & res_by_period$tidal_regime == "Neap"]
+res_neap_storm <- res_by_period$mean_res_d[res_by_period$period == "Storm"       & res_by_period$tidal_regime == "Neap"]
+
+# Storm water level elevation (continuous 25-h mean)
+storm_mean_wl <- mean_wl_by_period$mean_pressure_dbar[mean_wl_by_period$period == "Storm"]
+pre_mean_wl   <- mean_wl_by_period$mean_pressure_dbar[mean_wl_by_period$period == "Pre-storm"]
+storm_elev    <- storm_mean_wl - pre_mean_wl  # ~0.014 dbar
+```
+
+```{r print-supp-methods, results="asis"}
+cat("\n\n### Supplementary Methods — Tidal dynamics analysis\n\n")
+
+cat("To characterize how the restricted mākāhā connections modulate tidal exchange between Heʻeia Fishpond and Kāneʻohe Bay, we compared in-situ CTD pressure inside the fishpond with NOAA verified water levels at Station MOKH1 (Moku o Loʻe Island; NOAA CO-OPS, 2014) over the 67-day study period (10 June – 15 August 2014). Heʻeia Fishpond connects to Kāneʻohe Bay through three ocean mākāhā: Nui (OM1), Hīhīmanu (OM2), and Kahoalahui (Triple Mākāhā, TM), and to the upstream watershed through two river mākāhā: Waimāʻama (RM2) and Kaneloa (RM3) (Tognacchini, 2015). Two historical mākāhā remained unrestored at the time of this study: Wai (RM1), where wall breakage left a diffuse flow region between the wetland and the fishpond's northeast corner, and Kahoʻokele (Ocean Break), where a 50-m temporary wall of reduced height stood in place of the degraded original, permitting shallow surface-water exchange via overflow at higher tides.\n\n")
+
+cat("Kāneʻohe Bay exhibits a mixed semi-diurnal tide in which each tidal day comprises two unequal high–low cycles: a major (larger amplitude) constituent and a minor (smaller amplitude) constituent. The mākāhā filter the minor constituent almost entirely, such that fishpond water level resolves only the major cycle (~12 h period) rather than the bay's two-cycle-per-day signal. We therefore restricted lag and flux analyses to major-constituent extrema, classified using NOAA harmonic predictions and confirmed against an independent peak-detection algorithm applied to the CTD signal. We further classified each cycle by lunar regime — spring, intermediate, or neap — based on proximity to syzygy or quadrature.\n\n")
+
+cat("Tidal propagation lag was computed as the time difference between paired NOAA and CTD extrema of the same type (high or low) within a ±3 h matching window. Tidal flux was computed as the rate of pressure change between consecutive CTD extrema, with flooding and ebbing cycles separated by direction. Flood-versus-ebb rate comparisons within each lunar regime used a two-sided Wilcoxon rank-sum test.\n\n")
+
+cat(sprintf(
+"We estimated tidal residence time using a tidal-prism approximation: τ = (V̄ / P_half) × T_half, where V̄ is mean fishpond volume, P_half is the half-cycle tidal prism (excursion × surface area), and T_half is the half-cycle period. We estimated V̄ as ~%.0f m³ from a fishpond surface area of %.0f m² and a mean tidal-cycle water column depth of %.2f m. We derived this mean depth from the bathymetric measurements of Tognacchini (2015), who reports a mean fishpond water column depth of %.2f m at neap low water and an average tidal range of %.2f m, as the neap low-water depth plus half the average tidal range (%.2f m + %.2f m).\n\n",
+  mean_volume_m3, FISHPOND_AREA_M2, mean_depth_m,
+  NEAP_LW_DEPTH_M, AVG_TIDAL_RANGE_M,
+  NEAP_LW_DEPTH_M, AVG_TIDAL_RANGE_M / 2
+))
+```
+
+```{r print-supp-results, results="asis"}
+cat("\n\n### Supplementary Results — Storm Wali extended an already restricted and asymmetric tidal exchange\n\n")
+
+cat(sprintf(
+"Tidal extrema at Heʻeia Fishpond consistently lagged those at Moku o Loʻe. High tides at the fishpond lagged the open-ocean peak by a median of %.0f min (mean %.0f ± %.0f min, n = %d cycles), while low tides lagged by a median of %.0f min (mean %.0f ± %.0f min, n = %d cycles). Lag varied with tidal regime: high tides lagged by %.0f ± %.0f min during spring tides and %.0f ± %.0f min during neap tides, with intermediate cycles falling between (Table S3, Panel A). Low-tide lags exceeded high-tide lags across all regimes.\n\n",
+  lag_maj$median_lag[lag_maj$tide_type == "H"],
+  lag_maj$mean_lag[lag_maj$tide_type == "H"],
+  lag_maj$sd_lag[lag_maj$tide_type == "H"],
+  lag_maj$n[lag_maj$tide_type == "H"],
+  lag_maj$median_lag[lag_maj$tide_type == "L"],
+  lag_maj$mean_lag[lag_maj$tide_type == "L"],
+  lag_maj$sd_lag[lag_maj$tide_type == "L"],
+  lag_maj$n[lag_maj$tide_type == "L"],
+  lag_high_spring$mean_lag, lag_high_spring$sd_lag,
+  lag_high_neap$mean_lag,   lag_high_neap$sd_lag
+))
+
+# Pull flood/ebb test rows for sprintf
+fe_spring <- flood_ebb_test %>% filter(tidal_regime == "Spring")
+fe_neap   <- flood_ebb_test %>% filter(tidal_regime == "Neap")
+
+cat(sprintf(
+"Mean pressure change rate during rising tides exceeded that during falling tides at spring tides (%.3f vs. %.3f dbar h⁻¹; Wilcoxon p = %s; Figure S1, Panel E; Table S3, Panel B). At neap tides, when astronomical forcing was weakest, the asymmetry collapsed (flood:ebb ratio = %.2f, p = %.2f); flow rates dropped near-equally in both directions. Half-cycle counts differed slightly between rising and falling within each regime due to major/minor cycle filtering and excursion thresholds (Table S3, Panel B); reported asymmetry ratios are robust to this imbalance.\n\n",
+  fe_spring$rising_mean, fe_spring$falling_mean, formatC(fe_spring$p_value, format = "e", digits = 1),
+  fe_neap$asymmetry_ratio, fe_neap$p_value
+))
+
+cat(sprintf(
+"Tropical Storm Wali (20–23 July 2014) elevated mean fishpond water level. The continuous 25-h mean rose ~%.3f dbar above the pre-storm baseline during the storm and remained slightly elevated for ~5–6 days post-storm (Figure S1, Panel B), consistent with combined storm surge and freshwater runoff temporarily raising the fishpond baseline. The storm window coincided with the transition from neap to spring tides, with last quarter occurring on ~18–21 July (Table S3, Panel C).\n\n",
+  storm_elev
+))
+
+cat(sprintf(
+"Geometric tidal residence time varied with lunar regime: ~%.1f d at spring tides and ~%.1f d at neap tides. Storm Wali extended neap-regime residence time substantially (neap τ rose from ~%.1f d pre-storm to ~%.1f d during the storm, a ~%.0f%%%% increase). These geometric estimates align with the empirical tidal-exchange measurements of Tognacchini (2015), who measured 73%%%% volumetric water exchange per spring tidal cycle and 33%%%% per neap tidal cycle at the northeast study site, corresponding to residence-time scales of ~0.7 d at spring and ~1.6 d at neap.\n\n",
+  res_spring, res_neap,
+  res_neap_pre, res_neap_storm,
+  100 * (res_neap_storm / res_neap_pre - 1)
+))
+```
+
+```{r print-supp-discussion, results="asis"}
+cat("\n\n### Supplementary Discussion — Mākāhā hydraulics link storm forcing to extended residence time and delayed microbial recovery\n\n")
+
+cat("The lag and flux results together describe the mechanical character of tidal exchange through the mākāhā. Low-tide lags exceeding high-tide lags across all regimes (Supplementary Results, Table S3 Panel A) indicate that hydraulic restriction is greater on outflow (ebbing) than on inflow (flooding). The flood-versus-ebb rate asymmetry observed at spring and intermediate regimes (2.4–2.8×) supports the same mechanism from a different angle: hydraulic head drives faster flood through the mākāhā than gravity-only drainage on the ebb, and the asymmetry collapses at neap tides when the head differential itself becomes negligible. These two independent observations — lag asymmetry and rate asymmetry — point to the same physical bottleneck: the mākāhā impose a unidirectionally restricted exchange whose magnitude scales with astronomical forcing.\n\n")
+
+cat(sprintf(
+"The storm-period water level elevation observed in the detided continuous record (~%.3f dbar above the pre-storm baseline for ~5–6 days; Figure S1 Panel B) provides the cleanest visual evidence of Storm Wali's impact on fishpond hydrology. We cannot cleanly separate storm forcing from the natural neap reduction in tidal forcing in the major-cycle extrema data, because the storm window coincided with the neap-to-spring transition; the detided continuous record is free of this regime confound and isolates the storm-driven baseline shift.\n\n",
+  storm_elev
+))
+
+cat("Storm-extended residence time provides a hydrological mechanism for the protracted microbial-community recovery documented in the main text. Our geometric residence-time estimate (~30–50% extension during the storm window relative to pre-storm baseline within each regime) is consistent with the prolonged freshwater plume persistence (~19 days) that Tognacchini (2015) documented at Heʻeia Fishpond following Wali, well beyond the average HFP recovery scale of ~4 days reported by Timmermann et al. (in prep.). The convergence of three independent measurements — our geometric tidal-prism estimate, Tognacchini's volumetric exchange ratios, and the plume persistence finding — supports the inference that reduced tidal exchange under combined storm and neap forcing extended water-mass residence in the fishpond during the disturbance window, providing prolonged contact time between fishpond water and the perturbed microbial-community state before bay-water exchange could reassert.\n\n")
+```
+
+---
+
+```{r session-info}
+message("\n=== SESSION INFO ===")
+sessionInfo()
+```

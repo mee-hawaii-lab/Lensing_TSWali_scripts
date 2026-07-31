@@ -1,0 +1,530 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+library(patchwork)
+library(FSA)            
+library(RColorBrewer)
+library(rstudioapi)
+
+# ---- File paths ----
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/")
+output_path  <- file.path(current_path, "../output/domain_coupling")
+
+# ---- Plot settings ----
+source(file.path(current_path, "plotting_aesthetics.R")) # Loads theme_wali()
+
+# ---- Shared panel theme ----
+theme_panel <- function(base_size = 10, base_family = "") {
+  theme_classic(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      # Axes
+      axis.title       = element_text(size = base_size, colour = "black"),
+      axis.title.x     = element_text(margin = margin(t = 6), face = "bold"),
+      axis.title.y     = element_text(margin = margin(r = 6), face = "bold", angle = 90),
+      axis.text        = element_text(size = base_size - 1, colour = "black"),
+      axis.line        = element_line(linewidth = 0.4, colour = "black"),
+      axis.ticks       = element_line(linewidth = 0.4, colour = "black"),
+      axis.ticks.length = unit(2, "pt"),
+
+      # Panel & plot
+      panel.background = element_rect(fill = "white", colour = NA),
+      panel.grid       = element_blank(),
+      panel.spacing    = unit(6, "pt"),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      plot.margin      = margin(4, 4, 4, 4),
+
+      # Title / subtitle / tag (tag = "A", "B" panel labels from patchwork)
+      plot.title       = element_text(size = base_size + 1, face = "bold",
+                                      hjust = 0,
+                                      margin = margin(b = 4)),
+      plot.subtitle    = element_text(size = base_size, colour = "grey30",
+                                      hjust = 0,
+                                      margin = margin(b = 4)),
+      plot.tag         = element_text(size = base_size + 2, face = "bold"),
+      plot.tag.position = c(0, 1),
+
+      # Legend (sized for collected legends via patchwork)
+      legend.background = element_rect(fill = "white", colour = NA),
+      legend.key        = element_rect(fill = "white", colour = NA),
+      legend.title      = element_text(size = base_size, face = "bold"),
+      legend.text       = element_text(size = base_size - 1),
+      legend.key.size   = unit(10, "pt"),
+      legend.spacing.y  = unit(2, "pt"),
+      legend.margin     = margin(0, 0, 0, 6),
+
+      # Facet strips
+      strip.background  = element_rect(fill = "white", colour = NA),
+      strip.text        = element_text(size = base_size, colour = "black",
+                                       face = "plain"),
+
+      complete = TRUE
+    )
+}
+```
+
+
+## 1. Load & tidy phyloseq data
+```{r}
+# ---- Load 16S asv tables ----
+s16_abund_m <- data.matrix(read.csv(file.path(input_path,"s16_microbial/otu_tables/s16_asv_qc_relabund_table.csv"), row.names = 1)) # Count table
+s16_tax_m <- as.matrix(read.csv(file.path(input_path,"s16_microbial/otu_tables/s16_asv_qc_tax_table.csv"), row.names = 1)) # Taxonomy table
+s16_meta <- read.csv(file.path(input_path,"s16_microbial/otu_tables/s16_asv_qc_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Load 18S asv tables ----
+s18_abund_m <- data.matrix(read.csv(file.path(input_path,"s18_microbial/otu_tables/s18_otu_qc_relabund_table.csv"), row.names = 1)) # Count table
+s18_tax_m <- as.matrix(read.csv(file.path(input_path,"s18_microbial/otu_tables/s18_otu_qc_tax_table.csv"), row.names = 1)) # Taxonomy table
+s18_meta <- read.csv(file.path(input_path,"s18_microbial/otu_tables/s18_otu_qc_sample_data.csv"), row.names = 1)  # Sample data
+
+# ---- Create phyloseq objects ----
+(s16_ps_rel <- phyloseq(
+  otu_table(s16_abund_m, taxa_are_rows = T), 
+  tax_table(s16_tax_m),
+  sample_data(s16_meta)))
+
+(s18_ps_rel <- phyloseq(
+  otu_table(s18_abund_m, taxa_are_rows = T), 
+  tax_table(s18_tax_m),
+  sample_data(s18_meta)))
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+pchem  <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts   <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+
+# ---- Format levels ----
+set_levels <- function(ps) {
+  ps@sam_data$DM     <- factor(ps@sam_data$DM,     levels = dm)
+  ps@sam_data$Stage  <- factor(ps@sam_data$Stage,  levels = stage)
+  ps@sam_data$Site   <- factor(ps@sam_data$Site,   levels = site)
+  ps@sam_data$Region <- factor(ps@sam_data$Region, levels = region)
+  ps
+}
+s16_ps_rel <- set_levels(s16_ps_rel)
+s18_ps_rel <- set_levels(s18_ps_rel)
+```
+
+# 2. Generate shared & complete-case subsets  ----
+```{r}
+# ---- Key both domains on the cross-gene sample ID ----
+sample_names(s16_ps_rel) <- sample_data(s16_ps_rel)$Desc_Sample_ID
+sample_names(s18_ps_rel) <- sample_data(s18_ps_rel)$Desc_Sample_ID
+
+# ---- Shared samples (present in both domains) ----
+shared_samps        <- sort(intersect(sample_names(s16_ps_rel), sample_names(s18_ps_rel)))
+s16_ps_rel_shared  <- prune_samples(shared_samps, s16_ps_rel)
+s18_ps_rel_shared   <- prune_samples(shared_samps, s18_ps_rel)
+stopifnot(identical(sample_names(s16_ps_rel_shared), sample_names(s18_ps_rel_shared)))
+
+# ---- Single authoritative env table: combine both domains, one row per sample ----
+first_nonNA <- function(x) { x <- x[!is.na(x)]; if (length(x)) x[1] else NA_real_ }
+
+env_combined <- bind_rows(
+  as(sample_data(s16_ps_rel_shared), "data.frame")[, c(pchem, nuts)] %>% rownames_to_column("Desc_Sample_ID"),
+  as(sample_data(s18_ps_rel_shared), "data.frame")[, c(pchem, nuts)] %>% rownames_to_column("Desc_Sample_ID")
+) %>%
+  group_by(Desc_Sample_ID) %>%
+  summarise(across(all_of(c(pchem, nuts)), first_nonNA), .groups = "drop") %>%  # collapses the duplicate rows
+  column_to_rownames("Desc_Sample_ID")
+
+# ---- Complete cases, canonical (sorted) order ----
+env_clean   <- na.omit(env_combined)
+clean_samps <- sort(intersect(shared_samps, rownames(env_clean)))
+env_clean   <- env_clean[clean_samps, , drop = FALSE]
+
+# ---- Prune both domains to the same samples ----
+s16_ps_rel_clean <- prune_samples(clean_samps, s16_ps_rel_shared)
+s18_ps_rel_clean <- prune_samples(clean_samps, s18_ps_rel_shared)
+
+# ---- Sanity: identical membership (order is enforced where matrices are built) ----
+stopifnot(setequal(sample_names(s16_ps_rel_clean), clean_samps))
+stopifnot(setequal(sample_names(s18_ps_rel_clean), clean_samps))
+stopifnot(setequal(rownames(env_clean),            clean_samps))
+```
+
+
+## 3. Shared-set nMDS scores
+```{r}
+nmds_scores_shared <- function(ps_shared, label, seed = 123) {
+  set.seed(seed)
+  ps_h <- transform_sample_counts(ps_shared, function(x) sqrt(x))  # Hellinger
+  d    <- vegdist(as.matrix(t(otu_table(ps_h))), method = "bray")  # Bray-Curtis
+  ord  <- vegan::metaMDS(d, k = 2, try = 100, trace = 0)           # nMDS on the distance
+  message(paste0(label, " shared-set nMDS stress = ", round(ord$stress, 3)))
+  scores(ord, display = "sites") %>%
+    as.data.frame() %>%
+    rownames_to_column("Desc_Sample_ID") %>%
+    left_join(
+      as(sample_data(ps_shared), "data.frame")[, c("DM","Site","Stage")] %>%
+        rownames_to_column("Desc_Sample_ID"),
+      by = "Desc_Sample_ID")
+}
+
+s16_nmds_scores <- nmds_scores_shared(s16_ps_rel_shared, "16S")
+s18_nmds_scores  <- nmds_scores_shared(s18_ps_rel_shared,  "18S")
+
+# ---- Lock identical sample order across domains ----
+s16_nmds_scores <- s16_nmds_scores[order(s16_nmds_scores$Desc_Sample_ID), ]
+s18_nmds_scores <- s18_nmds_scores[ order(s18_nmds_scores$Desc_Sample_ID), ]
+stopifnot(identical(s16_nmds_scores$Desc_Sample_ID, s18_nmds_scores$Desc_Sample_ID))
+
+# ---- Write to .csv ----
+write.csv(s16_nmds_scores, file.path(output_path, "shared_16S_nmds_scores_shared.csv"), row.names = FALSE)
+write.csv(s18_nmds_scores, file.path(output_path, "shared_18S_nmds_scores_shared.csv"), row.names = FALSE)
+```
+
+
+## 4. Whole-community coupling — Mantel & partial Mantel
+```{r}
+# ---- Hellinger (sqrt) transformation ----
+hellinger_bray <- function(ps, samp_order) {
+  m <- as.matrix(t(otu_table(ps)))      # samples × taxa (relative abundance)
+  m <- m[samp_order, , drop = FALSE]    # enforce canonical order
+  vegdist(sqrt(m), method = "bray")     # Hellinger -> Bray-Curtis (matches notebook 08)
+}
+
+# ---- Distances ----
+s16_shared_dist <- hellinger_bray(s16_ps_rel_shared, shared_samps)   # all shared samples
+s18_shared_dist <- hellinger_bray(s18_ps_rel_shared, shared_samps)
+
+s16_clean_dist  <- hellinger_bray(s16_ps_rel_clean,  clean_samps)    # env-complete subset
+s18_clean_dist  <- hellinger_bray(s18_ps_rel_clean,  clean_samps)
+env_clean_dist  <- vegdist(scale(env_clean[clean_samps, ]), method = "euclidean")  # z-scored env
+
+# ---- Mantel: Bray(16S) vs Bray(18S), full shared set ----
+set.seed(123)
+(mantel_xy <- mantel(s16_shared_dist, s18_shared_dist,
+                     method = "pearson", permutations = 9999))
+
+# ---- Partial Mantel: 16S vs 18S, controlling for environmental distance ----
+set.seed(123)
+(mantel_partial <- mantel.partial(s16_clean_dist, s18_clean_dist, env_clean_dist,
+                                  method = "pearson", permutations = 9999))
+
+# ---- Tidy summary for later text/table assembly ----
+mantel_summary <- data.frame(
+  test = c("Mantel (16S~18S)", "Partial Mantel (| env)"),
+  n    = c(length(shared_samps), length(clean_samps)),
+  r    = round(c(mantel_xy$statistic,  mantel_partial$statistic), 3),
+  p    = c(mantel_xy$signif, mantel_partial$signif)
+); mantel_summary
+```
+**Methods:** Whole-community coupling between bacterial (16S) and microbial eukaryote (18S) assemblages was quantified with Mantel and partial Mantel tests (Pearson correlation, 9,999 permutations; vegan). Bray–Curtis dissimilarities were computed for each marker from Hellinger-transformed relative abundances on the shared set of co-occurring samples, with matched sample order verified. The partial Mantel test conditioned the 16S–18S correlation on environmental dissimilarity (Euclidean distances of z-scored physicochemical and nutrient variables) across the subset of samples with complete environmental data.
+
+
+## 5. Global Procrustes
+```{r}
+# ---- Read locked nMDS scores ----
+s16_sc <- read.csv(file.path(output_path, "shared_16S_nmds_scores_shared.csv"))
+s18_sc <- read.csv(file.path(output_path, "shared_18S_nmds_scores_shared.csv"))
+
+# ---- Align sample order ----
+s16_sc <- s16_sc[order(s16_sc$Desc_Sample_ID), ]
+s18_sc <- s18_sc[order(s18_sc$Desc_Sample_ID), ]
+stopifnot(identical(s16_sc$Desc_Sample_ID, s18_sc$Desc_Sample_ID))
+
+# ---- Configuration matrices (rows = samples) ----
+s16_mat <- as.matrix(s16_sc[, c("NMDS1","NMDS2")]); rownames(s16_mat) <- s16_sc$Desc_Sample_ID
+s18_mat <- as.matrix(s18_sc[, c("NMDS1","NMDS2")]); rownames(s18_mat) <- s18_sc$Desc_Sample_ID
+
+# ---- Symmetric Procrustes: 18S rotated onto 16S (16S = target) ----
+set.seed(123)
+pro  <- procrustes(X = s16_mat, Y = s18_mat, symmetric = TRUE)
+prot <- protest(  X = s16_mat, Y = s18_mat, symmetric = TRUE, permutations = 9999)
+
+message(paste0("Symmetric Procrustes r = ", round(prot$t0, 3),
+               ", p = ", signif(prot$signif, 3),
+               "  (SS = ", round(prot$ss, 3), ")"))
+
+# ---- Per-sample residuals + metadata ----
+resid_df <- data.frame(
+  Desc_Sample_ID = rownames(s16_mat),
+  residual       = residuals(pro)
+) %>%
+  left_join(s16_sc[, c("Desc_Sample_ID","DM","Site","Stage")], by = "Desc_Sample_ID")
+resid_df$DM    <- factor(resid_df$DM,    levels = dm)
+resid_df$Stage <- factor(resid_df$Stage, levels = stage)
+
+# residual distribution (for the manuscript text later)
+round(c(median = median(resid_df$residual),
+        min    = min(resid_df$residual),
+        max    = max(resid_df$residual)), 3)
+
+# ---- Residuals among sampling dates: KW + Dunn's (BH) ----
+kw   <- kruskal.test(residual ~ DM, data = resid_df); kw
+dunn <- FSA::dunnTest(residual ~ DM, data = resid_df, method = "bh"); dunn
+
+# ---- Panel A superimposition coordinates (16S target = hollow, 18S rotated = solid) ----
+superimp_df <- data.frame(
+  Desc_Sample_ID = rownames(pro$X),
+  x16 = pro$X[, 1],    y16 = pro$X[, 2],     # 16S target  (hollow anchor)
+  x18 = pro$Yrot[, 1], y18 = pro$Yrot[, 2]   # 18S rotated (solid, arrowhead)
+) %>%
+  left_join(resid_df[, c("Desc_Sample_ID","DM","Stage","residual")], by = "Desc_Sample_ID")
+superimp_df$DM <- factor(superimp_df$DM, levels = dm)
+
+# ---- Save components for the figure ----
+saveRDS(superimp_df, file.path(output_path, "../figure_supp7_domain_coupling/components/A_procrust_superimposition.rds"))
+saveRDS(resid_df,    file.path(output_path, "../figure_supp7_domain_coupling/components/B_procrust_residuals.rds"))
+```
+**Methods:** Concordance between bacterial and microbial eukaryote ordinations was assessed by symmetric Procrustes rotation of the two-dimensional nMDS configurations, with significance evaluated by PROTEST (9,999 permutations; vegan). The eukaryote configuration was rotated onto the bacterial configuration, and per-sample Procrustes residuals were extracted as a measure of local cross-domain mismatch. Differences in residual magnitude among sampling dates were tested with a Kruskal–Wallis rank-sum test, followed by Dunn's test with Benjamini–Hochberg correction.
+
+
+## 7. Variance partitioning
+```{r}
+# ---- Hellinger matrices (response & PCA inputs), in canonical order ----
+s16_hell <- as.matrix(t(otu_table(transform_sample_counts(s16_ps_rel_clean, sqrt))))[clean_samps, ]
+s18_hell <- as.matrix(t(otu_table(transform_sample_counts(s18_ps_rel_clean, sqrt))))[clean_samps, ]
+
+# ---- Environmental predictor matrices (z-scored), same order ----
+pchem_z <- scale(env_clean[clean_samps, pchem])
+nuts_z  <- scale(env_clean[clean_samps, nuts])
+
+# ---- Cross-domain predictors: PCA axes chosen by broken-stick ----
+bstick_axes <- function(hell_mat, label) {
+  pca <- rda(hell_mat)                       # unconstrained PCA of Hellinger data
+  ev  <- pca$CA$eig                          # eigenvalues
+  bs  <- bstick(pca)                         # broken-stick expectation
+  n   <- min(length(ev), length(bs))         # align defensively
+  k   <- max(1, sum(ev[1:n] > bs[1:n]))      # leading axes exceeding the null
+  message(paste0(label, ": broken-stick retains ", k, " PCA axes (",
+                 round(100 * sum(ev[1:k]) / sum(ev), 1), "% of variance)"))
+  scores(pca, choices = 1:k, display = "sites")
+}
+
+axes16 <- bstick_axes(s16_hell, "16S")        # 16S structure (predictor of 18S)
+axes18 <- bstick_axes(s18_hell, "18S")        # 18S structure (predictor of 16S)
+
+# ---- Variance partitioning (tb-RDA on Hellinger response) ----
+# X1 = physicochemical, X2 = nutrients, X3 = opposing-domain structure
+(vp16 <- varpart(s16_hell, pchem_z, nuts_z, axes18))   # 16S
+(vp18 <- varpart(s18_hell, pchem_z, nuts_z, axes16))   # 18S
+
+# ---- Significance of the cross-domain unique fractions (partial RDA) ----
+set.seed(123)
+anova(rda(s16_hell, axes18, cbind(pchem_z, nuts_z)), permutations = 9999)  # unique 18S | env
+anova(rda(s18_hell, axes16, cbind(pchem_z, nuts_z)), permutations = 9999)  # unique 16S | env
+
+# ---- Save for the figure (Panel C) ----
+saveRDS(vp16, file.path(output_path, "../figure_supp7_domain_coupling/components/C_varpart_16S.rds"))
+saveRDS(vp18, file.path(output_path, "../figure_supp7_domain_coupling/components/C_varpart_18S.rds"))
+```
+**Methods:** To quantify the unique and shared contributions of physicochemical conditions, nutrient concentrations, and cross-domain community structure to assemblage variation, variance partitioning (varpart; vegan) was performed separately for each marker on Hellinger-transformed OTU/ASV matrices (transformation-based redundancy analysis). Physicochemical and nutrient variables were z-scored and treated as two explanatory matrices. Because the full community matrices contain more taxa than samples, the structure of the opposing domain was summarized by principal component analysis of its Hellinger-transformed matrix, retaining the leading axes identified by the broken-stick criterion as a third explanatory matrix. Unique and shared fractions of adjusted R² were estimated for each predictor set, and the significance of the unique fractions was tested by partial redundancy analysis (9,999 permutations) conditioning on the remaining predictor sets.
+
+
+## 8. Plot procrustes superimposition
+```{r}
+# ---- Load saved superimposition coords ----
+superimp_df    <- readRDS(file.path(output_path, "../figure_supp7_domain_coupling/components/A_procrust_superimposition.rds"))
+superimp_df$DM <- factor(superimp_df$DM, levels = dm)
+
+# ---- Flatten a color at given alpha over white ----
+flatten_on_white <- function(cols, alpha) {
+  fg    <- grDevices::col2rgb(cols) / 255
+  mixed <- alpha * fg + (1 - alpha)          # white background channel = 1
+  grDevices::rgb(mixed[1, ], mixed[2, ], mixed[3, ])
+}
+
+alpha16        <- 0.2
+date_fill      <- setNames(date_cols, dm)                              # full color: rings + 18S fill
+date_fill_tint <- setNames(flatten_on_white(date_cols, alpha16), dm)   # opaque pale: 16S fill
+
+# ---- Arrow shortening + per-point fills ----
+gap     <- 0.007   # arrowhead gap (Procrustes axis units)
+alpha16 <- 0.2     # 16S anchor fill transparency — tune to taste
+date_fill <- setNames(date_cols, dm)
+
+superimp_df <- superimp_df %>%
+  mutate(
+    .dx   = x18 - x16,
+    .dy   = y18 - y16,
+    .len  = sqrt(.dx^2 + .dy^2),
+    .frac = pmax(0, (.len - gap) / .len),
+    x18_end = x16 + .dx * .frac,
+    y18_end = y16 + .dy * .frac,
+    fill16 = unname(date_fill_tint[as.character(DM)]),
+    fill18 = unname(date_fill[as.character(DM)])
+  )
+
+# ---- Label placement ----
+xr <- range(c(superimp_df$x16, superimp_df$x18))
+yr <- range(c(superimp_df$y16, superimp_df$y18))
+
+# ---- Build Panel A ----
+(panelA <- ggplot(superimp_df) +
+  geom_segment(data = dplyr::filter(superimp_df, .len > gap),
+               aes(x = x16, y = y16, xend = x18_end, yend = y18_end, color = DM),
+               arrow = arrow(length = unit(0.2, "cm"), type = "open"),
+               linewidth = 0.5, key_glyph = "point") +
+  geom_point(aes(x = x16, y = y16, fill = fill16, color = DM),   # 16S anchor: black ring, faded fill
+             shape = 21, size = 2) +
+  geom_point(aes(x = x18, y = y18, fill = fill18),   # 18S rotated: black ring, solid fill
+             shape = 21, color = "black", size = 2) +
+  scale_fill_identity() +
+  scale_color_manual(values = date_cols, name = "Date") +
+  labs(x = "Procrustes axis 1", y = "Procrustes axis 2") +
+  annotate("text", x = xr[1], y = yr[2], hjust = 0, vjust = 1,
+           label = "Symmetric Procrustes r = 0.78, p < 0.0001", size = 3.2) +
+  annotate("text", x = xr[1], y = yr[1], hjust = 0, vjust = 0,
+           label = "faded = 16S, solid = 18S", size = 2.8, color = "grey40") +
+  guides(color = guide_legend(override.aes = list(shape = 21, fill = date_cols,
+                                                   color = "black", size = 3, stroke = 0.4))) +
+  theme_wali() +
+  theme(legend.position = "right") + theme_panel())
+```
+
+## 9. Plot procrustes residuals
+```{r}
+# ---- Load saved residuals ----
+resid_df <- readRDS(file.path(output_path, "../figure_supp7_domain_coupling/components/B_procrust_residuals.rds"))
+resid_df$DM <- factor(resid_df$DM, levels = dm)
+
+# ---- Significant storm-date contrasts (Dunn's BH), star labels ----
+ymax <- max(resid_df$residual)
+brackets <- data.frame(
+  group1 = c("09 Jul", "16 Jul", "30 Jul"),
+  group2 = c("23 Jul", "23 Jul", "23 Jul"),
+  p.adj  = c(0.0145, 0.0254, 0.0154)
+) %>%
+  mutate(
+    stars      = as.character(symnum(p.adj, cutpoints = c(0, 0.001, 0.01, 0.05, 1),
+                                     symbols = c("***", "**", "*", "ns"))),
+    y.position = ymax + c(0.070, 0.045, 0.020)   # widest span on top
+  )
+
+# ---- Build Panel B ----
+(panelB <- ggplot(resid_df, aes(x = DM, y = residual)) +
+  geom_rect(xmin = 2.5, xmax = 3.5,
+            ymin = -Inf, ymax = Inf, fill = "#dfdfdf") +
+  stat_boxplot(geom = "errorbar", width = 0.5, lwd = 0.5) +
+  geom_boxplot(notch = FALSE, width = 0.5, lwd = 0.5) +
+  stat_pvalue_manual(brackets, label = "stars") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+  labs(x = "Date", y = "Procrustes residual") +
+  theme_panel() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)))
+```
+
+## 10. Plot variance partitioning
+```{r}
+# ---- Load saved varpart objects ----
+vp16 <- readRDS(file.path(output_path, "../figure_supp7_domain_coupling/components/C_varpart_16S.rds"))
+vp18 <- readRDS(file.path(output_path, "../figure_supp7_domain_coupling/components/C_varpart_18S.rds"))
+
+# ---- Pull fractions: [a]=pchem, [b]=nuts, [c]=cross-domain, [d:g]=shared, [h]=residual ----
+get_fracs <- function(vp) {
+  f <- vp$part$indfract$Adj.R.square
+  c("Cross-domain " = f[3],
+    "Physicochemical"           = f[1],
+    "Nutrients"                 = f[2],
+    "Shared"                    = sum(f[4:7]),
+    "Residual"                  = f[8])
+}
+mk_df <- function(vp, resp) {
+  fr <- get_fracs(vp)
+  data.frame(response = resp, fraction = names(fr), value = as.numeric(fr), row.names = NULL)
+}
+
+frac_levels <- c("Cross-domain ","Physicochemical","Nutrients","Shared","Residual")
+vp_df <- bind_rows(mk_df(vp16, "16S"), mk_df(vp18, "18S"))
+vp_df$fraction <- factor(vp_df$fraction, levels = frac_levels)
+vp_df$response <- factor(vp_df$response, levels = c("16S","18S"))  # 16S on top
+
+# ---- Spectral hexes for the category fractions + greys for shared/residual ----
+spec <- RColorBrewer::brewer.pal(11, "Spectral")
+frac_cols <- c(
+  "Cross-domain " = spec[11],  # purple
+  "Physicochemical"           = spec[10],  # blue
+  "Nutrients"                 = spec[9],   # teal
+  "Shared"                    = "grey70",
+  "Residual"                  = "grey88"
+)
+
+# ---- Cross-domain segment labels (predictor gene + %) ----
+cross_df <- vp_df %>%
+  filter(fraction == "Cross-domain ") %>%
+  mutate(predictor = ifelse(response == "16S", "18S", "16S"),
+         lab  = paste0(predictor, "  ", scales::percent(value, accuracy = 0.1)),
+         xpos = value / 2)
+
+# ---- Build Panel C ----
+(panelC <- ggplot(vp_df, aes(x = value, y = response, fill = fraction)) +
+  geom_col(width = 0.6, color = "black", linewidth = 0.3,
+           position = position_stack(reverse = TRUE)) +
+  geom_text(data = cross_df, aes(x = xpos, y = response, label = lab),
+            inherit.aes = FALSE, color = "white", size = 3) +
+  scale_fill_manual(values = frac_cols, name = NULL) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = "Adjusted variation explained", y = NULL) +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE)) +
+   theme_panel() +
+  theme(legend.position = "bottom"))
+```
+
+## 11. Assemble plots
+```{r}
+# ---- Partial assembly ----
+panelA <- panelA + theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 1,
+           override.aes = list(shape = 21, fill = date_cols, color = "black", size = 3, stroke = 0.4)))
+
+bott_row <- ggarrange(
+  panelB, 
+  ggarrange(panelC +
+            ggplot() + theme_void(), 
+            nrow = 2, heights = c(1,0.1)),
+  ncol = 2, nrow = 1, widths = c(1,2)
+  )
+
+blank <- ggplot() + theme_void()
+
+# ---- Full assembly ----
+(figS7 <- ggarrange(
+  # A
+  panelA + coord_fixed(),
+  # B
+  ggarrange(
+    panelB,
+    blank,
+    ggarrange(panelC, blank, nrow = 2, heights = c(1,0.25)),
+    ncol= 3,
+    widths = c(1,0.2,2)
+  ),
+  ncol = 1, nrow = 2, heights = c(1.5, 1)
+))
+
+# ---- Save ----
+ggsave(file.path(output_path, "../figure_supp7_domain_coupling/domain_coupling.pdf"), figS7,
+       width = 5, height = 6, units = "in", dpi = 1000)
+```
+
+
+```{r}
+```
+
+
+

@@ -1,0 +1,582 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Set up the environment
+```{r}
+# ---- Clear the environment ----
+rm(list=ls()) # (Optional) Clear the environment
+
+# ---- Load libraries ----
+library(readr)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(gstat)
+library(ggplot2)
+library(ggpubr)
+
+# ---- Set file paths ----
+folder_path <- "/Users/becca/Documents/current projects/Manuscript Storm Wali" # Folder location
+input_path  <- file.path(folder_path, "data") # Where to find input files
+output_path <- file.path(folder_path, "output") # Where to save output files
+```
+
+# Wrangle the data
+```{r}
+# Input file
+meta <- read_csv(file.path(input_path, "processed/physicochemistry/sample_data.csv"),
+                    show_col_types = FALSE)
+
+# Subset
+site_list <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10")
+meta <- meta %>%
+  mutate(Date = as.Date(as.character(Date), format = "%Y%m%d")) %>%
+  filter(!is.na(Date),
+         Date >= as.Date("2014-07-07"),
+         Date <= as.Date("2014-08-11")) %>%
+  filter(Site %in% site_list)
+
+# Variable sets
+vars_ysi  <- c("S_Temp_C","B_Temp_C",
+               "S_Salinity_ppt","B_Salinity_ppt",
+               "S_DO_mgL","B_DO_mgL",
+               "S_pH","B_pH")
+vars_hach <- c("NO2_uM","NO3_uM","PO4_uM","NH3_uM","SiO2_uM","Turb_FAU")
+vars_all <- c(vars_ysi, vars_hach)
+
+
+# Pivot to long format (THIS CREATES var and value)
+df_long <- meta %>%
+  pivot_longer(
+    cols      = any_of(vars_all),   # use vars_all; any_of is safer
+    names_to  = "var",
+    values_to = "value"
+  ) %>%
+  mutate(
+    layer = case_when(
+      grepl("^S_", var) ~ "S",
+      grepl("^B_", var) ~ "B",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+
+# Preview YSI data
+```{r}
+plot_hist <- function(var_name, bins = 30) {
+  df_long %>%
+    filter(var == var_name, !is.na(value)) %>%
+    ggplot(aes(x = value)) +
+    geom_histogram(
+      bins = bins,
+      color = "black",
+      position = "identity",
+      fill = "grey90",
+    ) +
+    theme_bw() +
+    labs(
+      title = paste("Raw distribution:", var_name),
+      x = var_name,
+      y = "Count"
+    )
+}
+
+# Temp and Salinity
+ggarrange(
+  plot_hist("S_Temp_C"), 
+  plot_hist("S_Salinity_ppt"),
+  plot_hist("B_Temp_C"),
+  plot_hist("B_Salinity_ppt")
+          )
+
+# pH and DO
+ggarrange(
+  plot_hist("S_pH"),
+  plot_hist("S_DO_mgL"),
+  plot_hist("B_pH"),
+  plot_hist("B_DO_mgL")
+          )
+```
+
+# QC flags
+## Flag computation
+```{r}
+df_hach <- df_long %>%
+  filter(var %in% vars_hach)
+
+# ---- Flag 1: robust MAD flag within Date × layer × var ----
+flag_mad_within_group <- function(df_hach, mad_cut = 2.5, min_n = 4) {
+  df_hach %>%
+    group_by(Date, layer, var) %>%
+    mutate(
+      n_group = sum(!is.na(value)),
+      med = median(value, na.rm = TRUE),
+      md  = mad(value, constant = 1, na.rm = TRUE),
+      z_mad = ifelse(is.na(md) | md == 0, 0, (value - med) / md),
+      flag_mad = !is.na(value) & n_group >= min_n & (abs(z_mad) >= mad_cut)
+    ) %>%
+    ungroup() %>%
+    select(-med, -md, -n_group)
+}
+
+# ---- Flag 2: spatial neighbor flag ----
+flag_loo_idw <- function(df,
+                         z_cut = 2,
+                         power = 2,
+                         min_n = 3,
+                         crs_proj = 32604) {
+  
+  out <- df %>%
+    mutate(
+      idw_pred = NA_real_,
+      idw_resid = NA_real_,
+      z_resid = NA_real_,
+      flag_spatial = FALSE
+    )
+  
+  groups <- out %>% distinct(Date, layer, var)
+  
+  for (i in seq_len(nrow(groups))) {
+    
+    d  <- groups$Date[i]
+    ly <- groups$layer[i]
+    vv <- groups$var[i]
+    
+    # FIX: Handle NA layer properly
+    if (is.na(ly)) {
+      idx <- which(out$Date == d &
+                     is.na(out$layer) &
+                     out$var == vv &
+                     !is.na(out$value) &
+                     !is.na(out$Lon) & !is.na(out$Lat))
+    } else {
+      idx <- which(out$Date == d &
+                     out$layer == ly &
+                     out$var == vv &
+                     !is.na(out$value) &
+                     !is.na(out$Lon) & !is.na(out$Lat))
+    }
+    
+    n <- length(idx)
+    if (n < min_n) next
+    
+    sub <- out[idx, , drop = FALSE]
+    
+    sub_sf <- st_as_sf(sub, coords = c("Lon", "Lat"), crs = 4326, remove = FALSE) %>%
+      st_transform(crs_proj)
+    xy <- st_coordinates(sub_sf)
+    
+    pred <- rep(NA_real_, n)
+    
+    # Leave-one-out IDW prediction
+    for (r in seq_len(n)) {
+      
+      dists <- sqrt((xy[r, 1] - xy[-r, 1])^2 + (xy[r, 2] - xy[-r, 2])^2)
+      vals  <- sub$value[-r]
+      
+      weights <- 1 / (dists^power + 1e-10)
+      weights <- weights / sum(weights)
+      
+      pred[r] <- sum(weights * vals, na.rm = TRUE)
+    }
+    
+    resid <- sub$value - pred
+    
+    # Standardize residuals
+    resid_spread <- sd(resid, na.rm = TRUE)
+    
+    if (is.na(resid_spread) || resid_spread == 0) {
+      z_resid <- rep(0, n)
+    } else {
+      z_resid <- resid / resid_spread
+    }
+    
+    out$idw_pred[idx]     <- pred
+    out$idw_resid[idx]    <- resid
+    out$z_resid[idx]      <- z_resid
+    out$flag_spatial[idx] <- abs(z_resid) >= z_cut
+  }
+  
+  out
+}
+```
+
+## Run flags
+```{r}
+# Stage 1 (MAD): Run on df_hach
+qc_stage1 <- flag_mad_within_group(df_hach, mad_cut = 2.5)
+
+# Stage 2 (Spatial LOO-IDW): Run on df_hach separately
+qc_stage2 <- flag_loo_idw(df_hach, z_cut = 2, power = 2)
+
+# Combine: Join the spatial flag back to Stage 1 results
+df_hach_qc <- qc_stage1 %>%
+  left_join(
+    qc_stage2 %>%
+      select(Desc_Sample_ID, var, idw_pred, idw_resid, z_resid, flag_spatial),
+    by = c("Desc_Sample_ID", "var")
+  ) %>%
+  mutate(
+    instrument = case_when(
+      var %in% vars_ysi  ~ "YSI",
+      var %in% vars_hach ~ "Hach",
+      TRUE ~ NA_character_
+    ),
+    
+    flag_any = coalesce(flag_mad, FALSE) | coalesce(flag_spatial, FALSE),
+    
+    flag_questionable = case_when(
+      instrument == "Hach" ~ (coalesce(flag_mad, FALSE) & coalesce(flag_spatial, FALSE)),
+      instrument == "YSI"  ~ FALSE,
+      TRUE ~ FALSE
+    ),
+    
+    qc_status = case_when(
+      instrument == "YSI"  & flag_any ~ "YSI_flag_diagnostic",
+      instrument == "YSI"             ~ "YSI_kept",
+      instrument == "Hach" & flag_questionable ~ "Hach_questionable",
+      instrument == "Hach"                     ~ "Hach_kept",
+      TRUE                                     ~ "unclassified"
+    )
+  )
+
+# Verify the join worked
+df_hach_qc %>%
+  dplyr::summarize(
+    n_rows = n(),
+    has_mad_flag = sum(!is.na(flag_mad)),
+    has_spatial_flag = sum(!is.na(flag_spatial)),
+    n_mad_true = sum(flag_mad, na.rm = TRUE),
+    n_spatial_true = sum(flag_spatial, na.rm = TRUE),
+    n_both = sum(flag_mad & flag_spatial, na.rm = TRUE),
+    n_questionable = sum(flag_questionable, na.rm = TRUE)
+  )
+```
+
+## Summarize flags
+```{r}
+# Summarize flags by variable
+(flag_summary_var <- df_hach_qc %>%
+  dplyr::group_by(var) %>%
+  summarize(
+    n_total        = sum(!is.na(value)),
+    n_flagged      = sum(flag_any & !is.na(value), na.rm = TRUE),
+    pct_flagged    = round(100 * n_flagged / n_total, 1),
+    n_mad_only     = sum(flag_mad & !flag_spatial & !is.na(value), na.rm = TRUE),
+    n_spatial_only = sum(!flag_mad & flag_spatial & !is.na(value), na.rm = TRUE),
+    n_both         = sum(flag_mad & flag_spatial & !is.na(value), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_flagged)))
+
+# Are flags consistently tied to specific sites?
+df_hach_qc %>%
+  dplyr::filter(flag_any, !is.na(value)) %>%
+  dplyr::count(var, Site) %>%
+  pivot_wider(
+    names_from  = Site,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  dplyr::select(
+    var,
+    any_of(site_list)
+  ) # Notes: Missing sites have zero flagged values across all variables
+
+
+# Are flags consistently tied to specific dates?
+df_hach_qc %>%
+  dplyr::filter(flag_any, !is.na(value)) %>%
+  dplyr::count(var, Date) %>%
+  dplyr::mutate(Date = as.Date(Date)) %>%        
+  dplyr::arrange(Date) %>%
+  pivot_wider(
+    names_from  = Date,
+    values_from = n,
+    values_fill = 0
+  ) # Notes: Missing dates have zero flagged values across all variables
+
+# Do the flag values violate physical plausibility?
+df_hach_qc %>%
+  filter(var %in% vars_hach, !is.na(value)) %>%
+  group_by(var) %>%
+  summarize(
+    min_flagged = min(value),
+    max_flagged = max(value),
+    .groups = "drop"
+  )
+```
+
+## Preview Hach data
+```{r}
+plot_hist_flag <- function(var_name, bins = 30) {
+  df_hach_qc %>%
+    filter(var == var_name, !is.na(value)) %>%
+    mutate(
+      flag_type = case_when(
+        flag_mad & flag_spatial ~ "Both",
+        flag_mad ~ "MAD only",
+        flag_spatial ~ "Spatial only",
+        TRUE ~ "Kept"
+      ),
+      flag_type = factor(
+        flag_type,
+        levels = c("Kept", "MAD only", "Spatial only", "Both")
+      )
+    ) %>%
+    ggplot(aes(x = value, fill = flag_type)) +
+    geom_histogram(
+      bins = bins,
+      color = "black",
+      position = "identity",
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Kept"  = "grey90",
+        "MAD only"     = "blue",
+        "Spatial only" = "red",
+        "Both"         = "purple"
+      ),
+      name = "QC flag type"
+    ) +
+    theme_bw() +
+    labs(
+      title = paste("Raw distribution:", var_name),
+      x = var_name,
+      y = "Count"
+    )
+}
+
+leg <- as_ggplot(ggpubr::get_legend(plot_hist_flag("NH3_uM")))
+
+ggarrange(
+  plot_hist_flag("Turb_FAU") + scale_x_continuous(trans = "log1p") + theme(legend.position = "none"),
+  plot_hist_flag("PO4_uM") + scale_x_continuous(trans = "log1p") + theme(legend.position = "none"),
+  plot_hist_flag("SiO2_uM") + scale_x_continuous(trans = "log1p")  + theme(legend.position = "none"),
+  leg
+)
+
+ggarrange(
+  plot_hist_flag("NO3_uM") + scale_x_continuous(trans = "log1p") + theme(legend.position = "none"),
+  plot_hist_flag("NO2_uM") + scale_x_continuous(trans = "log1p") + theme(legend.position = "none"),
+  plot_hist_flag("NH3_uM") + scale_x_continuous(trans = "log1p") + theme(legend.position = "none"),
+  leg
+)
+```
+
+## Remove flagged values
+```{r}
+# Overwrite value for flagged Hach values
+df_hach_qc_nas <- df_hach_qc %>%
+  mutate(
+    instrument = "Hach",
+    flag_any = coalesce(flag_mad, FALSE) | coalesce(flag_spatial, FALSE),
+    value = if_else(flag_any, NA_real_, value),  # Remove if either flag is TRUE
+    layer = NA_character_
+  )
+
+# YSI: unchanged (pulled from df_long)
+df_ysi <- df_long %>%
+  filter(var %in% vars_ysi)
+
+# Combine
+df_final_qc <- bind_rows(df_ysi, df_hach_qc_nas) %>%
+  arrange(Date, Site, var)
+stopifnot(length(setdiff(vars_all, unique(df_final_qc$var))) == 0) # Sanity check
+
+# Sanity check
+df_final_qc %>%
+  group_by(var) %>%
+  summarize(
+    n_na = sum(is.na(value)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_na))
+```
+
+# Replace missing values
+## IDW imputation
+```{r}
+impute_idw_overwrite <- function(df,
+                                 value_col = "value",
+                                 x_col = "Lon",
+                                 y_col = "Lat",
+                                 id_col = "Desc_Sample_ID",
+                                 power = 2,
+                                 k = 5,
+                                 min_n = 3,
+                                 crs_ll = 4326,
+                                 crs_proj = 32604,
+                                 keep_diag = TRUE) {
+
+  stopifnot(all(c("Date","var","layer", x_col, y_col, value_col) %in% names(df)))
+
+  out <- df %>%
+    mutate(
+      was_imputed = FALSE  # optional diagnostic; can be dropped at end
+    )
+
+  groups <- out %>% distinct(Date, var, layer)
+
+  for (i in seq_len(nrow(groups))) {
+
+    d  <- groups$Date[i]
+    vv <- groups$var[i]
+    ly <- groups$layer[i]
+
+    # ---- NA-safe layer indexing (Hach has layer = NA) ----
+    if (is.na(ly)) {
+      idx <- which(out$Date == d & out$var == vv & is.na(out$layer))
+    } else {
+      idx <- which(out$Date == d & out$var == vv & out$layer == ly)
+    }
+    if (length(idx) == 0) next
+    # ------------------------------------------------------
+
+    sub <- out[idx, , drop = FALSE]
+
+    # Only rows with coords are eligible for imputation
+    sub <- sub %>% filter(!is.na(.data[[x_col]]), !is.na(.data[[y_col]]))
+
+    # observed vs missing (ONLY missing will be overwritten)
+    obs <- sub %>% filter(!is.na(.data[[value_col]]))
+    mis <- sub %>% filter(is.na(.data[[value_col]]))
+
+    if (nrow(mis) == 0) next
+    if (nrow(obs) < min_n) next
+
+    obs_sf <- st_as_sf(obs, coords = c(x_col, y_col), crs = crs_ll, remove = FALSE) %>%
+      st_transform(crs_proj)
+    mis_sf <- st_as_sf(mis, coords = c(x_col, y_col), crs = crs_ll, remove = FALSE) %>%
+      st_transform(crs_proj)
+
+    k_use <- min(k, nrow(obs))
+
+    pred <- gstat::idw(
+      formula   = as.formula(paste0(value_col, " ~ 1")),
+      locations = obs_sf,
+      newdata   = mis_sf,
+      idp       = power,
+      nmax      = k_use
+    )
+
+    # Write predictions directly into out[[value_col]] for the NA rows
+    mis_ids <- mis[[id_col]]
+    write_idx <- idx[match(mis_ids, out[[id_col]][idx])]
+
+    out[[value_col]][write_idx] <- pred$var1.pred
+    out$was_imputed[write_idx]  <- !is.na(pred$var1.pred)
+  }
+
+  if (!keep_diag) out <- out %>% select(-was_imputed)
+
+  out
+}
+```
+
+## Run imputation
+```{r}
+df_final_qc_overwrite <- impute_idw_overwrite(
+  df_final_qc,
+  value_col = "value",
+  k = 5,
+  min_n = 3,
+  power = 2,
+  keep_diag = FALSE   # <- set TRUE if you want to briefly audit what changed
+)
+
+# Summarize changes to missing values
+df_final_qc %>%
+  dplyr::group_by(var) %>%
+  dplyr::summarize(
+    n_missing_before = sum(is.na(value)),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    df_final_qc_overwrite %>%
+      dplyr::group_by(var) %>%
+      dplyr::summarize(
+        n_missing_after = sum(is.na(value)),
+        .groups = "drop"
+      ),
+    by = "var"
+  ) %>%
+  dplyr::arrange(desc(n_missing_before))
+```
+
+## Overwrite final pchem values 
+```{r}
+df_final_qc_overwrite_wide <- df_final_qc_overwrite %>%
+  dplyr::select(Desc_Sample_ID, var, value) %>%
+  distinct() %>%   # safety: ensure one row per sample×var
+  pivot_wider(
+    names_from  = var,
+    values_from = value
+  )
+
+meta_qc <- meta %>%
+  dplyr::select(-any_of(vars_all)) %>%                                     # drop original measurement columns
+  dplyr::left_join(df_final_qc_overwrite_wide, by = "Desc_Sample_ID") %>%  # add QC’ed measurement columns
+  dplyr::select(all_of(names(meta)))                                        # enforce exact meta column order
+stopifnot(identical(names(meta_qc), names(meta)) & identical(meta_qc$Desc_Sample_ID, meta$Desc_Sample_ID)) # sanity check
+```
+
+## Save processed data
+```{r}
+# Transform data and calculate molecular ratios
+meta_qc_trans <- meta_qc %>%
+  mutate(
+    across(
+      c(NO3_uM, NO2_uM, NH3_uM, PO4_uM, SiO2_uM, Turb_FAU),
+      ~ log10(.x + 1),
+      .names = "{.col}_t"
+    )
+  ) %>%
+  mutate(
+    tin = NO3_uM + NO2_uM + NH3_uM,
+
+    tin_to_tip = if_else(PO4_uM == 0, NA_real_, tin / PO4_uM),
+    tin_to_sil = if_else(SiO2_uM == 0, NA_real_, tin / SiO2_uM),
+    sil_to_sal = if_else(S_Salinity_ppt == 0, NA_real_, SiO2_uM / S_Salinity_ppt),
+
+    across(
+      c(tin, tin_to_tip, tin_to_sil, sil_to_sal),
+      ~ log10(.x + 1),
+      .names = "{.col}_t"
+    )
+  )
+
+
+# Re-read original and pull OM2 rows for the same date window
+om2 <- read_csv(file.path(input_path, "processed/physicochemistry/sample_data.csv"),
+                show_col_types = FALSE) %>%
+  mutate(Date = as.Date(as.character(Date), format = "%Y%m%d")) %>%
+  filter(!is.na(Date),
+         Date >= as.Date("2014-07-07"),
+         Date <= as.Date("2014-08-11"),
+         !Site %in% site_list)  # everything NOT in P1-P10, i.e. OM2
+
+# Bind — missing columns in om2 will fill with NA automatically
+meta_qc_trans_full <- bind_rows(meta_qc_trans, om2) %>%
+  arrange(Date, Site)
+
+# Save to file
+write.csv(
+  meta_qc_trans_full,
+  file.path(output_path, "../data/processed/physicochemistry/sample_data_qc_imputed.csv"),
+  row.names = FALSE
+)
+
+meta_qc_trans_full
+```
+
+# Summary of quality control and imputation.
+
+**Plain-language summary**
+We carefully reviewed all water-quality measurements to identify values that appeared inconsistent with nearby sampling locations. For each measurement, we compared its value to what would be expected based on neighboring sites sampled on the same day—values that differed substantially from their spatial neighbors were flagged for review. Handheld colorimetric measurements (used for nutrients and turbidity) are more sensitive to procedural variability than in-water sensors, so we applied an additional statistical filter to these data; only values flagged by both methods were removed. Sensor-based measurements (YSI) showed strong spatial consistency and were retained as measured. Any missing or removed values were then estimated using inverse distance weighting from nearby locations sampled on the same day, allowing us to fill small gaps without altering overall spatial patterns.
+
+**Publication-ready summary**
+We applied a two-stage quality-control procedure combining robust MAD filtering and leave-one-out spatial consistency checks to identify and remove potentially unreliable colorimetric nutrient and turbidity values prior to analysis. YSI sensor measurements showed strong spatial consistency and were retained without modification. Missing and removed values were interpolated using inverse distance weighting (IDW) within sampling date and variable groups, using spatially-proximal observations to preserve observed gradients.

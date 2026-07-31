@@ -1,0 +1,951 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Set up the environment
+```{r}
+# ── Clear the environment ──
+rm(list=ls()) # optional
+
+# ── Load libraries ──
+library(readr)      # loading CSV data
+library(readxl)     # loading Excel data (if needed)
+library(dplyr)      # data wrangling and summarizing
+library(tidyr)      # reshaping data
+library(ggplot2)    # boxplots
+library(ggpubr)     # publication-ready plot arrangement
+library(ggpubr)
+library(FSA)
+library(purrr)
+library(ggpubr)
+library(FSA)
+library(scales)
+
+# ── File paths ──
+current_path <- current_path <- getwd()
+input_path  <- file.path(current_path, "../data") # Where to find input files
+output_path <- file.path(current_path, "../output") # Where to save output files
+
+# ──Input data ──
+meta <- read_csv(file.path(input_path, "processed/physicochemistry/sample_data_qc_imputed.csv"),
+                    show_col_types = FALSE)[,-c(1)]
+```
+
+# Wrangle the data ──
+```{r}
+rownames(meta) <- meta$Desc_Sample_ID # Set row names
+meta$Date <- as.Date(meta$Date) # Format date column
+meta$Date[meta$Date == as.Date("2014-07-24")] <- as.Date("2014-07-23") # Assign 24 July to 23 July
+meta <- meta %>% filter(Date != as.Date("2014-08-11")) # Omit 11 August from analysis
+
+# ── Assign storm stage ──
+meta$Stage <- dplyr::case_when( 
+  meta$Date <  as.Date("2014-07-20") ~ "Pre-Storm",
+  meta$Date <= as.Date("2014-07-23") ~ "TS Wali",
+  meta$Date >  as.Date("2014-07-23") ~ "Post-Storm")
+
+# ── Factor ordering ──
+meta$Stage  <- factor(meta$Stage, levels = c("Pre-Storm", "TS Wali", "Post-Storm"))
+meta$Site   <- factor(meta$Site,   levels =
+                        c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2"))
+meta$Region <- factor(meta$Region, levels = c("Kahawai","Mauka","Makai"))
+
+# ── Define variable order ──
+var_order <- c(
+  "S_Temp_C", "B_Temp_C",
+  "S_Salinity_ppt", "B_Salinity_ppt",
+  "S_DO_mgL", "B_DO_mgL",
+  "S_pH", "B_pH",
+  "Turb_FAU",
+  "NO3_uM", "NO2_uM", "NH3_uM", "PO4_uM", "SiO2_uM",
+  "tin_to_tip", "tin_to_sil", "sil_to_sal"
+)
+
+# ── Define variable names ──
+display_labels <- tribble(
+  ~Variable,         ~Parameter,
+  "S_Temp_C",        "Surface Temp. (C)",
+  "B_Temp_C",        "Bottom Temp. (C)",
+  "S_Salinity_ppt",  "Surface Salinity (ppt)",
+  "B_Salinity_ppt",  "Bottom Salinity (ppt)",
+  "S_DO_mgL",        "Surface DO (mg L-1)",
+  "B_DO_mgL",        "Bottom DO (mg L-1)",
+  "S_pH",            "Surface pH",
+  "B_pH",            "Bottom pH",
+  "Turb_FAU",        "Turbidity (FAU)",
+  "NO3_uM",          "NO3- (uM)",
+  "NO2_uM",          "NO2- (uM)",
+  "NH3_uM",          "NH3-N (uM)",
+  "PO4_uM",          "PO43- (uM)",
+  "SiO2_uM",         "SiO2 (uM)",
+  "tin",              "TIN (uM)",
+  "tin_to_tip",       "TIN:PO43-",
+  "tin_to_sil",       "TIN:SiO2",
+  "sil_to_sal",       "SiO2:Salinity"
+)
+display_labels <- display_labels %>%
+  mutate(Variable = factor(Variable, levels = var_order)) %>%
+  arrange(Variable)
+
+# ── Define significant figure limits ──
+sig_figs <- tribble(
+  ~Variable,         ~dec_mean, ~dec_delta,
+  "S_Temp_C",             1,         1,
+  "B_Temp_C",             1,         1,
+  "S_Salinity_ppt",       1,         1,
+  "B_Salinity_ppt",       1,         1,
+  "S_DO_mgL",             1,         1,
+  "B_DO_mgL",             1,         1,
+  "S_pH",                 2,         2,
+  "B_pH",                 2,         2,
+  "NO3_uM",               1,         1,
+  "NO2_uM",               2,         2,
+  "NH3_uM",               1,         1,
+  "PO4_uM",               1,         1,
+  "SiO2_uM",              0,         0,
+  "Turb_FAU",             0,         0,
+  "tin",                   1,         1,
+  "tin_to_tip",            1,         1,
+  "tin_to_sil",            2,         2,
+  "sil_to_sal",            1,         1
+)
+
+# ── Preview ──
+meta
+unique(meta$Date)
+colnames(meta)
+
+# ── Pivot long ──
+meta_long <- meta %>%
+  select(Site, Region, Date, Stage,
+         all_of(var_order)) %>%
+  pivot_longer(cols = all_of(var_order),
+               names_to = "Variable",
+               values_to = "Value") %>%
+  filter(!is.na(Value))
+```
+
+# Tabulate regional x storm phase summaries
+## Mean, standard deviation, and percent change
+```{r}
+# ── Summarize by Stage × Region, plus "All" ──
+stage_region <- meta_long %>%
+  group_by(Variable, Stage, Region) %>%
+  summarise(n = n(), Mean = mean(Value), SD = sd(Value),
+            .groups = "drop")
+
+stage_all <- meta_long %>%
+  group_by(Variable, Stage) %>%
+  summarise(n = n(), Mean = mean(Value), SD = sd(Value),
+            .groups = "drop") %>%
+  mutate(Region = "All")
+
+summary_long <- bind_rows(stage_region, stage_all) %>%
+  mutate(Region = factor(Region,
+                         levels = c("Kahawai", "Mauka", "Makai", "All")))
+
+# ── Pre-storm baseline per Variable × Region (reference for change calculations) ──
+pre_baseline <- summary_long %>%
+  filter(Stage == "Pre-Storm") %>%
+  select(Variable, Region, Pre_Mean = Mean)
+
+# ── Percent change vs pre-storm ──
+summary_long <- summary_long %>%
+  left_join(pre_baseline, by = c("Variable", "Region")) %>%
+  mutate(
+    Pct_change = ifelse(Stage == "Pre-Storm", NA_real_,
+                        (Mean - Pre_Mean) / Pre_Mean * 100)
+  ) %>%
+  select(-Pre_Mean)
+
+# ── Format ──
+summary_out <- summary_long %>%
+  left_join(sig_figs, by = "Variable") %>%
+  rowwise() %>%
+  mutate(
+    Mean_fmt   = sprintf(paste0("%.", dec_mean, "f"), Mean),
+    SD_fmt     = sprintf(paste0("\u00B1 %.", dec_mean, "f"), SD),
+    Pct_change = ifelse(is.na(Pct_change), NA_character_,
+                        sprintf("%.1f", Pct_change))
+  ) %>%
+  ungroup() %>%
+  select(Variable, Region, Stage, Mean_fmt, SD_fmt, Pct_change)
+
+# ── Pivot wide by Stage ──
+summary_wide <- summary_out %>%
+  pivot_wider(
+    id_cols     = c(Variable, Region),
+    names_from  = Stage,
+    values_from = c(Mean_fmt, SD_fmt, Pct_change),
+    names_glue  = "{Stage}_{.value}"
+  ) %>%
+  select(
+    Variable, Region,
+    `Pre-Storm_Mean_fmt`, `Pre-Storm_SD_fmt`,
+    `TS Wali_Mean_fmt`, `TS Wali_SD_fmt`, `TS Wali_Pct_change`,
+    `Post-Storm_Mean_fmt`, `Post-Storm_SD_fmt`, `Post-Storm_Pct_change`
+  ) %>%
+  mutate(Variable = factor(Variable, levels = var_order)) %>%
+  arrange(Variable)
+
+# ── View ──
+summary_wide
+
+# ── Save ──
+write.csv(
+  summary_wide,
+  file.path(output_path,"disturbance_response/pchem_mean_sd_pct_chg.csv"))
+```
+
+## Medians and ranges
+```{r}
+# ── Reference table: Median, Min, Max by Stage × Region ──
+desc_ref <- meta_long %>%
+  group_by(Variable, Stage, Region) %>%
+  summarise(
+    Median = median(Value),
+    Min    = min(Value),
+    Max    = max(Value),
+    .groups = "drop"
+  )
+
+desc_all <- meta_long %>%
+  group_by(Variable, Stage) %>%
+  summarise(
+    Median = median(Value),
+    Min    = min(Value),
+    Max    = max(Value),
+    .groups = "drop"
+  ) %>%
+  mutate(Region = "All")
+
+desc_long <- bind_rows(desc_ref, desc_all) %>%
+  mutate(Region = factor(Region,
+                         levels = c("Kahawai", "Mauka", "Makai", "All")))
+
+# ── Format with sig figs ──
+desc_long <- desc_long %>%
+  left_join(sig_figs, by = "Variable") %>%
+  rowwise() %>%
+  mutate(
+    Median_fmt = sprintf(paste0("%.", dec_mean, "f"), Median),
+    Min_fmt    = sprintf(paste0("%.", dec_mean, "f"), Min),
+    Max_fmt    = sprintf(paste0("%.", dec_mean, "f"), Max)
+  ) %>%
+  ungroup() %>%
+  select(Variable, Region, Stage, Median_fmt, Min_fmt, Max_fmt)
+
+# ── Pivot wide by Stage ──
+desc_wide <- desc_long %>%
+  pivot_wider(
+    id_cols     = c(Variable, Region),
+    names_from  = Stage,
+    values_from = c(Median_fmt, Min_fmt, Max_fmt),
+    names_glue  = "{Stage}_{.value}"
+  ) %>%
+  select(
+    Variable, Region,
+    `Pre-Storm_Median_fmt`, `Pre-Storm_Min_fmt`, `Pre-Storm_Max_fmt`,
+    `TS Wali_Median_fmt`, `TS Wali_Min_fmt`, `TS Wali_Max_fmt`,
+    `Post-Storm_Median_fmt`, `Post-Storm_Min_fmt`, `Post-Storm_Max_fmt`
+  ) %>%
+  left_join(display_labels, by = "Variable") %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter, Region) %>%
+  select(Parameter, Region, everything(), -Variable)
+
+# ── View ──
+desc_wide
+
+# ── Save ──
+write.csv(
+  desc_wide,
+  file.path(output_path,"disturbance_response/pchem_med_min_max.csv"))
+```
+
+# Tabulate fold changes
+```{r}
+# ── Reference table: Absolute change and fold change only ──
+# pre_baseline is defined in the "Mean, standard deviation, and percent change"
+# chunk above; this reuses it (no need to redefine).
+change_ref <- summary_long %>%
+  left_join(pre_baseline, by = c("Variable", "Region")) %>%
+  mutate(
+    Absolute = Mean - Pre_Mean,   # storm − pre  AND  post − pre
+    Fold     = Mean / Pre_Mean    # storm ÷ pre   AND  post ÷ pre
+  ) %>%
+  left_join(sig_figs, by = "Variable") %>%
+  rowwise() %>%
+  mutate(
+    Absolute_fmt = ifelse(is.na(Absolute), NA_character_,
+                          sprintf(paste0("%.", dec_mean, "f"), Absolute)),
+    Fold_fmt     = ifelse(is.na(Fold), NA_character_,
+                          sprintf("%.2f", Fold))
+  ) %>%
+  ungroup() %>%
+  filter(Stage != "Pre-Storm") %>%
+  select(Variable, Region, Stage, Absolute_fmt, Fold_fmt)
+
+# ── Pivot wide by Stage ──
+change_ref_wide <- change_ref %>%
+  pivot_wider(
+    id_cols     = c(Variable, Region),
+    names_from  = Stage,
+    values_from = c(Absolute_fmt, Fold_fmt),
+    names_glue  = "{Stage}_{.value}"
+  ) %>%
+  rename(
+    Pre_Storm_Absolute_change  = `TS Wali_Absolute_fmt`,
+    Pre_Storm_Fold_change      = `TS Wali_Fold_fmt`,
+    Post_Storm_Absolute_change = `Post-Storm_Absolute_fmt`,
+    Post_Storm_Fold_change     = `Post-Storm_Fold_fmt`
+  ) %>%
+  left_join(display_labels, by = "Variable") %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter, Region) %>%
+  select(Parameter, Region,
+         Pre_Storm_Absolute_change, Pre_Storm_Fold_change,
+         Post_Storm_Absolute_change, Post_Storm_Fold_change)
+
+# ── View ──
+change_ref_wide
+
+# ── Save ──
+write.csv(
+  change_ref_wide,
+  file.path(output_path,"disturbance_response/pchem_abs_fold_chg.csv"))
+```
+
+# Calculate date recoveries
+```{r}
+# ── Pre-storm envelope ──
+pre_envelope <- meta_long %>%
+  filter(Stage == "Pre-Storm") %>%
+  group_by(Variable) %>%
+  summarise(
+    pre_mean = mean(Value),
+    pre_sd   = sd(Value),
+    .groups  = "drop"
+  )
+
+# ── Z-scores by region ──
+recovery_region <- meta_long %>%
+  filter(Date > as.Date("2014-07-21")) %>%
+  group_by(Variable, Region, Date) %>%
+  summarise(daily_mean = mean(Value), .groups = "drop") %>%
+  left_join(pre_envelope, by = "Variable") %>%
+  mutate(z = (daily_mean - pre_mean) / pre_sd)
+
+# ── Z-scores pooled ("All") ──
+recovery_all <- meta_long %>%
+  filter(Date > as.Date("2014-07-21")) %>%
+  group_by(Variable, Date) %>%
+  summarise(daily_mean = mean(Value), .groups = "drop") %>%
+  left_join(pre_envelope, by = "Variable") %>%
+  mutate(z = (daily_mean - pre_mean) / pre_sd,
+         Region = "All")
+
+# ── Combine ──
+recovery_combined <- bind_rows(recovery_region, recovery_all) %>%
+  mutate(Region = factor(Region,
+                         levels = c("Kahawai", "Mauka", "Makai", "All")))
+
+# ── Classify recovery status ──
+recovery_class <- recovery_combined %>%
+  group_by(Variable, Region) %>%
+  arrange(Date) %>%
+  summarise(
+    any_within      = any(abs(z) <= 1),
+    first_date      = ifelse(any(abs(z) <= 1),
+                             format(min(Date[abs(z) <= 1]), "%d %b"),
+                             NA_character_),
+    # Check if all dates from first recovery onward stay within envelope
+    sustained       = ifelse(
+      any(abs(z) <= 1),
+      all(abs(z[Date >= min(Date[abs(z) <= 1])]) <= 1),
+      FALSE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Status = case_when(
+      !any_within            ~ "Not recovered",
+      any_within & sustained ~ "Recovered",
+      any_within & !sustained ~ "Transient"
+    ),
+    Recovery_label = case_when(
+      Status == "Not recovered" ~ "Not recovered",
+      Status == "Recovered"     ~ first_date,
+      Status == "Transient"     ~ paste0(first_date, "*")
+    )
+  )
+
+# ── Pivot wide ──
+recovery_ref <- recovery_class %>%
+  select(Variable, Region, Recovery_label) %>%
+  pivot_wider(
+    names_from  = Region,
+    values_from = Recovery_label
+  ) %>%
+  left_join(display_labels, by = "Variable") %>%
+  select(Parameter, Kahawai, Mauka, Makai, All) %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter)
+
+# ── View ──
+recovery_ref
+
+# ── Save ──
+write.csv(
+  recovery_ref,
+  file.path(output_path,"disturbance_response/pchem_regional_recovery.csv"))
+```
+Dates indicate the first post-storm sampling date at which the fishpond-wide daily mean had returned to within ± 1 SD (|z| ≤ 1) of the pre-storm mean. † Variable transiently returned to within the pre-storm envelope on this date but exceeded it on one or more subsequent sampling dates, indicating unstable recovery. "Not recovered" indicates the variable remained outside the pre-storm envelope throughout the observation window (through 06 August 2014):
+* Recovered — the variable returned to within |z| ≤ 1 of the pre-storm mean and remained there for all subsequent sampling dates. This represents stable return to baseline conditions.
+* Transiently recovered — the variable returned to within |z| ≤ 1 on at least one post-storm date but exceeded the envelope (|z| > 1) on one or more subsequent dates. This indicates an unstable or oscillating recovery trajectory, where the variable briefly revisited pre-storm conditions but did not sustain them.
+* Not recovered — the variable never returned to within |z| ≤ 1 during the observation window (through 06 August 2014). The system remained detectably perturbed for this variable throughout the study period.
+
+
+# Calculate stratification
+```{r}
+# ── Reshape for paired surface vs bottom ──
+strat_data <- meta %>%
+  select(Site, Date, Stage,
+         S_Temp_C, S_Salinity_ppt, S_DO_mgL, S_pH,
+         B_Temp_C, B_Salinity_ppt, B_DO_mgL, B_pH) %>%
+  pivot_longer(
+    cols = -c(Site, Date, Stage),
+    names_to = c("Depth", "Variable"),
+    names_pattern = "^(S|B)_(.+)$",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value))
+
+# ── Wilcoxon signed-rank: paired by site within each date ──
+wilcox_strat <- strat_data %>%
+  group_by(Variable, Date) %>%
+  summarise(
+    n_sites    = n_distinct(Site),
+    S_median   = median(Value[Depth == "S"]),
+    B_median   = median(Value[Depth == "B"]),
+    Diff       = median(Value[Depth == "S"] - Value[Depth == "B"]),
+    wilcox_V   = tryCatch(
+      wilcox.test(Value[Depth == "S"], Value[Depth == "B"],
+                  paired = TRUE, exact = FALSE)$statistic,
+      error = function(e) NA_real_),
+    wilcox_p   = tryCatch(
+      wilcox.test(Value[Depth == "S"], Value[Depth == "B"],
+                  paired = TRUE, exact = FALSE)$p.value,
+      error = function(e) NA_real_),
+    .groups = "drop"
+  ) %>%
+  group_by(Variable) %>%
+    mutate(
+      wilcox_p_adj = p.adjust(wilcox_p, method = "BH"),   # BH within each variable, across its dates
+      Sig = case_when(
+        is.na(wilcox_p_adj)   ~ "\u2014",
+        wilcox_p_adj <= 0.001 ~ "***",
+        wilcox_p_adj <= 0.01  ~ "**",
+        wilcox_p_adj <= 0.05  ~ "*",
+        TRUE                  ~ "ns"
+      )
+    ) %>%
+    ungroup()
+
+# ── Display labels for stratification variables ──
+strat_labels <- tribble(
+  ~Variable,       ~Parameter,
+  "Temp_C",        "Temperature (\u00B0C)",
+  "Salinity_ppt",  "Salinity (ppt)",
+  "DO_mgL",        "DO (mg L\u207B\u00B9)",
+  "pH",            "pH"
+)
+
+# ── Format for table ──
+strat_table <- wilcox_strat %>%
+  mutate(
+    Date_label = format(Date, "%d %b"),
+    cell       = paste0(round(Diff, 2), " (", Sig, ")")
+  ) %>%
+  select(Variable, Date_label, cell) %>%
+  pivot_wider(
+    names_from  = Date_label,
+    values_from = cell
+  ) %>%
+  left_join(strat_labels, by = "Variable") %>%
+  mutate(Parameter = factor(Parameter, levels = strat_labels$Parameter)) %>%
+  arrange(Parameter) %>%
+  select(Parameter, everything(), -Variable)
+
+# ── View ──
+strat_table
+
+# ── Save ──
+write.csv(
+  strat_table,
+  file.path(output_path,"disturbance_response/pchem_stratification.csv"))
+```
+
+# Temporal variation in physicochemistry
+```{r}
+# ── Panel A: Kruskal-Wallis across dates ──
+kw_tests <- meta_long %>%
+  group_by(Variable) %>%
+  summarise(
+    kw_chi2 = kruskal.test(Value ~ Date)$statistic,
+    kw_p    = kruskal.test(Value ~ Date)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    kw_p_adj = p.adjust(kw_p, method = "BH")          # BH across the 17-parameter family
+  ) %>%
+  mutate(
+    Sig = case_when(
+      kw_p_adj <= 0.001 ~ "***",
+      kw_p_adj <= 0.01  ~ "**",
+      kw_p_adj <= 0.05  ~ "*",
+      TRUE              ~ "ns"
+    ),
+    kw_chi2 = round(kw_chi2, 2),
+    kw_p    = ifelse(kw_p_adj < 0.001, "< 0.001", sprintf("%.3f", kw_p_adj))
+  )
+
+panel_a <- kw_tests %>%
+  left_join(display_labels, by = "Variable") %>%
+  select(Parameter, kw_chi2, kw_p, Sig) %>%
+  rename(Chi2 = kw_chi2, p = kw_p) %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter)
+
+# ── Panel B: Z-score trajectories ──
+panel_b <- meta_long %>%
+  group_by(Variable, Date) %>%
+  summarise(daily_mean = mean(Value), .groups = "drop") %>%
+  left_join(pre_envelope, by = "Variable") %>%
+  mutate(
+    z = round((daily_mean - pre_mean) / pre_sd, 2),
+    Date_label = format(Date, "%d %b")
+  ) %>%
+  select(Variable, Date_label, z) %>%
+  pivot_wider(
+    names_from  = Date_label,
+    values_from = z
+  ) %>%
+  left_join(display_labels, by = "Variable") %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter) %>%
+  select(Parameter, everything(), -Variable)
+
+# ── Combine ──
+temporal_table <- left_join(panel_a, panel_b, by = "Parameter")
+
+# ── View ──
+temporal_table
+
+# ── Save ──
+write.csv(
+  temporal_table,
+  file.path(output_path, "disturbance_response/pchem_temporal_variation.csv"),
+  row.names = FALSE)
+```
+
+# Spatial variation in physicochemistry
+```{r}
+# ── CV (%) by date ──
+cv_long <- meta_long %>%
+  group_by(Variable, Date) %>%
+  summarise(
+    CV = ifelse(mean(Value) < 0.001, NA_real_,
+                (sd(Value) / mean(Value)) * 100),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Date_label = format(Date, "%d %b"),
+    CV = round(CV, 1)
+  )
+
+cv_long_labeled <- cv_long %>%
+  mutate(Date_label = paste0(format(Date, "%d %b"), "_CV")) %>%
+  select(Variable, Date_label, CV) %>%
+  pivot_wider(names_from = Date_label, values_from = CV)
+
+# ── Kruskal-Wallis by Region within each date ──
+kw_region <- meta_long %>%
+  group_by(Variable, Date) %>%
+  summarise(
+    kw_chi2 = kruskal.test(Value ~ Region)$statistic,
+    kw_p    = kruskal.test(Value ~ Region)$p.value,
+    .groups = "drop"
+  ) %>%
+  group_by(Variable) %>%
+  mutate(
+    kw_p_adj = p.adjust(kw_p, method = "BH"),   # BH within each variable, across its dates
+    Sig = case_when(
+      is.na(kw_p_adj)   ~ "ns",
+      kw_p_adj <= 0.001 ~ "***",
+      kw_p_adj <= 0.01  ~ "**",
+      kw_p_adj <= 0.05  ~ "*",
+      TRUE              ~ "ns"
+    ),
+    kw_chi2 = round(kw_chi2, 2)
+  ) %>%
+  ungroup()
+
+kw_long_labeled <- kw_region %>%
+  mutate(
+    Date_label = paste0(format(Date, "%d %b"), "_KW"),
+    cell = paste0(kw_chi2, " (", Sig, ")")
+  ) %>%
+  select(Variable, Date_label, cell) %>%
+  pivot_wider(names_from = Date_label, values_from = cell)
+
+# ── Combine and interleave by date ──
+spatial_table <- cv_long_labeled %>%
+  left_join(kw_long_labeled, by = "Variable") %>%
+  left_join(display_labels, by = "Variable") %>%
+  mutate(Parameter = factor(Parameter, levels = display_labels$Parameter)) %>%
+  arrange(Parameter) %>%
+  select(
+    Parameter,
+    `07 Jul_CV`, `07 Jul_KW`,
+    `09 Jul_CV`, `09 Jul_KW`,
+    `14 Jul_CV`, `14 Jul_KW`,
+    `16 Jul_CV`, `16 Jul_KW`,
+    `21 Jul_CV`, `21 Jul_KW`,
+    `23 Jul_CV`, `23 Jul_KW`,
+    `29 Jul_CV`, `29 Jul_KW`,
+    `30 Jul_CV`, `30 Jul_KW`,
+    `06 Aug_CV`, `06 Aug_KW`
+  )
+
+# ── View ──
+spatial_table
+
+# ── Save ──
+write.csv(
+  spatial_table,
+  file.path(output_path, "disturbance_response/pchem_spatial_variation.csv"),
+  row.names = FALSE)
+```
+NA indicates coefficient of variation (CV) undefined due to near-zero mean concentrations
+
+# Boxplox
+```{r}
+# ── Setup ──
+# Use the FULL set of discrete-environmental sampling dates (Date), not just the
+# five microbially co-registered dates (Microbe_Date). Build a chronological,
+# human-readable date factor that every panel shares.
+date_lookup <- meta %>%
+  distinct(Date) %>%
+  arrange(Date) %>%
+  mutate(Date_lab = format(Date, "%d %b"))
+
+date_levels <- date_lookup$Date_lab          # chronological labels, e.g. "07 Jul" ... "06 Aug"
+storm_lab   <- format(as.Date("2014-07-23"), "%d %b")   # "23 Jul": storm sampling date
+
+# Full set of pairwise comparisons in canonical "earlier - later" order
+# (documentation / sanity reference; matching below is index-based, not string-based)
+pc_order <- combn(date_levels, 2, FUN = function(x) paste(x[1], x[2], sep = " - "))
+
+# Which pairwise comparisons receive a significance BRACKET on the plot.
+# NB: the full Dunn's table (all pairs) is always returned in `pc`; this only
+# controls what is drawn, to keep panels legible.
+#   "vs_storm" : 23 Jul vs every other date   (default - matches the figure's purpose)
+#   "adjacent" : consecutive sampling dates    (recovery-trajectory view)
+#   "all"      : every significant pair         (faithful but visually dense: up to ~20/panel)
+#   "none"     : no brackets
+bracket_mode <- "vs_storm"
+
+# Helper: choose which comparison keys get brackets, given the dates present in a panel
+pick_brackets <- function(levels_present, mode) {
+  if (mode == "none" || length(levels_present) < 2) return(character(0))
+  pr <- combn(levels_present, 2, simplify = FALSE)   # chronological pairs
+  keep <- switch(mode,
+    "all"      = pr,
+    "vs_storm" = Filter(function(p) storm_lab %in% p, pr),
+    "adjacent" = Filter(function(p) abs(diff(match(p, date_levels))) == 1, pr),
+    stop("Unknown bracket mode: ", mode)
+  )
+  vapply(keep, function(p) paste(p[1], p[2], sep = " - "), character(1))
+}
+
+# ── Helper functions ──
+plog_y <- function(value, sigma, base = 10) { # pseudo-log y conversion
+  asinh(value / (2 * sigma)) / log(base)
+}
+
+# ── Plotting function ──
+plot_box_sig <- function(variable, y_lab, y_position, layer,
+                         breaks = NULL, labels = NULL, limits = NULL,
+                         line = NULL, trans = "identity",
+                         brackets = bracket_mode, y_top = NULL) {
+
+  # Wrangle data: drop NAs on the VALUE only (Date is always present), so all
+  # discrete sampling dates are retained - this is the key change vs. the
+  # Microbe_Date version, which silently dropped non-microbial dates.
+  d <- meta %>%
+    select(Date, all_of(variable)) %>%
+    rename(Value = 2) %>%
+    filter(!is.na(Value)) %>%
+    left_join(date_lookup, by = "Date") %>%
+    mutate(
+      Layer    = layer,
+      Date_lab = factor(Date_lab, levels = date_levels[date_levels %in% Date_lab])
+    )
+
+  levels_present <- levels(d$Date_lab)
+
+  # Kruskal-Wallis across all sampling dates
+  set.seed(123)
+  kw <- kruskal.test(Value ~ Date_lab, data = d)
+
+  kw_result <- tibble(
+    Variable = variable,
+    Chi2     = round(kw$statistic, 2),
+    p        = round(kw$p.value, 4),
+    p_adj    = p.adjust(kw$p.value, method = "BH"),
+    Sig      = as.character(symnum(p.adjust(kw$p.value, method = "BH"),
+                                   corr = FALSE, na = FALSE,
+                                   cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                                   symbols = c("***", "**", "*", ".", "ns")))
+  )
+
+  # Dunn's post-hoc: ALL pairwise comparisons, BH-adjusted (matches the KW family)
+  pc_test <- dunnTest(Value ~ Date_lab, data = d, method = "bh")
+  pc_res  <- pc_test$res %>%
+    separate(Comparison, into = c("g1", "g2"), sep = " - ") %>%
+    # canonicalise each pair to earlier - later by chronological position,
+    # so bracket selection and ordering are robust to dunnTest's label order
+    mutate(
+      i1     = match(g1, date_levels),
+      i2     = match(g2, date_levels),
+      group1 = ifelse(i1 <= i2, g1, g2),
+      group2 = ifelse(i1 <= i2, g2, g1),
+      Variable = variable,
+      Sig = as.character(symnum(P.adj, corr = FALSE, na = FALSE,
+                                cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                                symbols = c("***", "**", "*", ".", "ns")))
+    ) %>%
+    rename(p = P.adj) %>%
+    select(Variable, group1, group2, Z, p, Sig)
+
+  # Build plot
+  p <- ggplot(d, aes(x = Date_lab, y = Value))
+
+  # Storm-window band: 21-23 Jul (immediate TS Wali impact period)
+  storm_band <- match(format(as.Date(c("2014-07-21", "2014-07-23")), "%d %b"),
+                      levels_present)
+  storm_band <- storm_band[!is.na(storm_band)]
+  if (length(storm_band) > 0) {
+    p <- p + geom_rect(xmin = min(storm_band) - 0.5, xmax = max(storm_band) + 0.5,
+                       ymin = -Inf, ymax = Inf, fill = "#dfdfdf")
+  }
+
+  # Reference line
+  if (!is.null(line)) {
+    p <- p + geom_hline(yintercept = line, color = "black",
+                        linetype = "dotted", linewidth = 0.5)
+  }
+
+  # Boxplot
+  p <- p +
+    stat_boxplot(geom = "errorbar", color = "black", width = 0.5, linewidth = 0.5) +
+    geom_boxplot(aes(fill = layer), notch = FALSE, width = 0.5, linewidth = 0.5)
+
+  # Y-axis: single combined call
+  scale_args <- list(name = y_lab, trans = trans)
+  if (!is.null(breaks))  scale_args$breaks <- breaks
+  if (!is.null(labels))  scale_args$labels <- labels
+  if (!is.null(limits))  scale_args$limits <- limits
+  p <- p + do.call(scale_y_continuous, scale_args)
+
+  # Theme
+  p <- p +
+    theme_light() +
+    theme(
+      legend.position = "none",
+      plot.margin = margin(1, 1, 1, 1, "lines"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.25),
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.y = element_text(color = "black", size = 10, face = "bold",
+                                  margin = margin(r = 5)),
+      axis.text.y = element_text(color = "black", size = 10),
+      axis.ticks = element_line(color = "black", linewidth = 0.5)
+    ) +
+    scale_fill_manual(name = "Water Layer",
+                      breaks = c("Surface", "Bottom"),
+                      values = c("Surface" = "white", "Bottom" = "white"))
+
+ # Significance bars (full Dunn's stays in pc_res / pc; only the chosen
+  # subset is drawn). Widest spans are drawn on top.
+  keep_keys <- pick_brackets(levels_present, brackets)
+  sig_pairs <- pc_res %>%
+    mutate(key = paste(group1, group2, sep = " - ")) %>%
+    filter(p <= 0.05, key %in% keep_keys) %>%
+    mutate(span = abs(match(group2, levels_present) - match(group1, levels_present))) %>%
+    arrange(span) %>%
+    rename(p_sign = Sig)
+
+  if (nrow(sig_pairs) > 0) {
+    n_bar <- nrow(sig_pairs)
+    # Evenly distribute brackets between y_position (lowest) and y_top (highest)
+    # when y_top is supplied; otherwise fall back to step-increment stacking.
+    if (!is.null(y_top) && n_bar > 1) {
+      bar_y <- seq(y_position, y_top, length.out = n_bar)
+      p <- p + stat_pvalue_manual(sig_pairs,
+                                  tip.length = 0.02,
+                                  y.position = bar_y,
+                                  label = "p_sign",
+                                  vjust = 0.65)
+    } else {
+      p <- p + stat_pvalue_manual(sig_pairs,
+                                  step.increase = 0.1,
+                                  y.position = y_position,
+                                  label = "p_sign",
+                                  vjust = 0.65)
+    }
+  }
+
+  return(list(plot = p, kw = kw_result, dunn = pc_res))
+}
+
+# Theme add-on: rotated date labels for the bottom panel of each column
+x_dates <- theme(
+  axis.text.x = element_text(color = "black", size = 8,
+                             angle = 45, hjust = 1, vjust = 1)
+)
+
+## ── Generate all plots ──
+results <- list()
+
+# YSI surface and bottom
+results$S_Temp_C       <- plot_box_sig("S_Temp_C", "Temperature (\u00B0C)", 30.5, "Surface",
+                            limits = c(22.5, 33),
+                            breaks = c(24, 26, 28, 30), y_top = 32.5)
+results$B_Temp_C       <- plot_box_sig("B_Temp_C", "Temperature (\u00B0C)", 30.5, "Bottom",
+                            limits = c(22.5, 33),
+                            breaks = c(24, 26, 28, 30), y_top = 32.3)
+results$S_Salinity_ppt <- plot_box_sig("S_Salinity_ppt", "Salinity (PSU)", 37.5, "Surface",
+                            limits = c(0, 60),
+                            breaks = c(5, 15, 25, 35), y_top = 57)
+results$B_Salinity_ppt <- plot_box_sig("B_Salinity_ppt", "Salinity (PSU)", 37.5, "Bottom",
+                            limits = c(0, 60),
+                            breaks = c(5, 15, 25, 35), y_top = 57)
+results$S_DO_mgL       <- plot_box_sig("S_DO_mgL", expression(bold("DO (mg L"^-1*")")), 12.5, "Surface",
+                            limits = c(3, 14.5),
+                            breaks = c(4, 6, 8, 10, 12))
+results$B_DO_mgL       <- plot_box_sig("B_DO_mgL", expression(bold("DO (mg L"^-1*")")), 12.5, "Bottom",
+                            limits = c(3, 14.5),
+                            breaks = c(4, 6, 8, 10, 12), y_top = 14.4)
+results$S_pH           <- plot_box_sig("S_pH", "pH", 8.9, "Surface",
+                            limits = c(6.8, 9.8), y_top = 9.75)
+results$B_pH           <- plot_box_sig("B_pH", "pH", 8.9, "Bottom",
+                            limits = c(6.8, 9.8), y_top = 9.75)
+
+# Hach nutrients (log-transformed variables)
+results$tin <- plot_box_sig("tin", expression(bold("TIN" ~(mu*M))),
+                       plog_y(26, sigma = 0.5), "Surface",
+                       trans = pseudo_log_trans(sigma = 0.5, base = 10),
+                       breaks = c(1, 3, 10, 30))
+results$NO3_uM    <- plot_box_sig("NO3_uM", expression(bold("NO"[3]^"-" ~(mu*M))),
+                       plog_y(33, 0.5), "Surface",
+                       trans = pseudo_log_trans(sigma = 0.5, base = 10),
+                       limits = c(0, 400),
+                       breaks = c(0, 1, 3, 10, 30), y_top = plog_y(250, 0.5))
+results$NO2_uM    <- plot_box_sig("NO2_uM", expression(bold("NO"[2]^"-" ~(mu*M))),
+                       0.25, "Surface",
+                       breaks = c(0, 0.1, 0.2))
+results$NH3_uM    <- plot_box_sig("NH3_uM", expression(bold("NH"[3]*"-N" ~(mu*M))),
+                       plog_y(20, 0.3), "Surface",
+                       trans = pseudo_log_trans(sigma = 0.3, base = 10),
+                       limits = c(0, 200),
+                       breaks = c(0, 1, 3, 10), y_top = plog_y(95, 0.3))
+results$PO4_uM    <- plot_box_sig("PO4_uM", expression(bold("PO"[4]^"3-" ~(mu*M))),
+                       2.35, "Surface",
+                       limits = c(0, 3.4),
+                       breaks = c(0, 0.5, 1, 1.5, 2), y_top = 3.0)
+results$SiO2_uM   <- plot_box_sig("SiO2_uM", expression(bold("SiO"[2] ~(mu*M))),
+                       plog_y(450, 10), "Surface",
+                       trans = pseudo_log_trans(sigma = 10, base = 10),
+                       limits = c(0, 1500),
+                       breaks = c(30, 100, 300), y_top = plog_y(900, 10))
+results$Turb_FAU  <- plot_box_sig("Turb_FAU", expression(bold("Turbidity (FAU)")),
+                       plog_y(42, 0.5), "Surface",
+                       trans = pseudo_log_trans(sigma = 0.5, base = 10),
+                       limits = c(0, 200),
+                       breaks = c(0, 1, 3, 10, 30), y_top = plog_y(120, 0.5))
+
+# Stoichiometric ratios
+results$tin_to_tip <- plot_box_sig("tin_to_tip", expression(bold("TIN:PO"[4]^"3-")),
+                       plog_y(220, 1), "Surface",
+                       trans = pseudo_log_trans(sigma = 1, base = 10),
+                       limits = c(0.4, 350),
+                       breaks = c(1, 3, 10, 30, 100),
+                       line = 16)
+
+results$tin_to_sil <- plot_box_sig("tin_to_sil", expression(bold("TIN:SiO"[2])),
+                       plog_y(1.3, 0.01), "Surface",
+                       trans = pseudo_log_trans(sigma = 0.01, base = 10),
+                       limits = c(0.002, 8),
+                       breaks = c(0.01, 0.1, 1),
+                       line = 1, y_top = plog_y(4.0, 0.01))
+
+results$sil_to_sal <- plot_box_sig("sil_to_sal", expression(bold("SiO"[2] ~ ":" ~ "Salinity")),
+                       plog_y(1700, 1), "Surface",
+                       trans = pseudo_log_trans(sigma = 1, base = 10),
+                       limits = c(0, 12000),
+                       breaks = c(1, 10, 100, 1000),
+                       labels = c("1","10","100","1,000"), y_top = plog_y(6800, 1))
+
+# ── Extract results ──
+all_plots <- map(results, "plot")
+env <- bind_rows(map(results, "kw"))
+pc  <- bind_rows(map(results, "dunn"))
+
+# ── Arrange and save ──
+empty_plot <- ggplot() + theme_void()
+
+ggarrange(
+  all_plots$S_Temp_C,
+  all_plots$B_Temp_C + theme(axis.title.y = element_blank()),
+  all_plots$tin,
+  all_plots$PO4_uM,
+  all_plots$tin_to_tip,
+  all_plots$S_Salinity_ppt,
+  all_plots$B_Salinity_ppt + theme(axis.title.y = element_blank()),
+  all_plots$NO3_uM,
+  all_plots$SiO2_uM,
+  all_plots$tin_to_sil,
+  all_plots$S_DO_mgL,
+  all_plots$B_DO_mgL + theme(axis.title.y = element_blank()),
+  all_plots$NO2_uM,
+  all_plots$Turb_FAU + x_dates,           # bottom of column 4 (row 4 is empty)
+  all_plots$sil_to_sal + x_dates,         # bottom of column 5 (row 4 is empty)
+  all_plots$S_pH + x_dates,
+  all_plots$B_pH + theme(axis.title.y = element_blank()) + x_dates,
+  all_plots$NH3_uM + x_dates,
+  empty_plot,
+  empty_plot,
+  ncol = 5,
+  nrow = 4,
+  align = "hv",
+  labels = c("A", "", "B", "", "C")
+)
+
+ggsave(file.path(output_path, "figure_supp3_pchem_boxplots/pchem_boxplots_dunns.pdf"),
+      device = "pdf", width = 12, height = 11, units = "in", dpi = 1000)
+
+# ── View results tables ──
+env
+pc
+```
+
+
+

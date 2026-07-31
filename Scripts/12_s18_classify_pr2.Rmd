@@ -1,0 +1,94 @@
+---
+title: "18S OTU taxonomic classification against PR2 v5.1.1 (mothur)"
+author: "Becca"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+ 
+## Purpose
+
+Reclassify 18S OTU representative sequences against the **PR2 (Protist Ribosomal
+Reference) database <https://pr2-database.org/> using mothur's Wang/RDP-style naive Bayesian
+classifier. This replaces the default SILVA-based assignments produced by the
+C-MAIKI pipeline. PR2 is curated specifically for eukaryotic SSU rRNA and
+generally provides finer-resolution protistan taxonomy than SILVA for 18S data.
+
+Inputs:
+
+- `OTUs.97.rep.fasta` — representative sequences at 97% OTU clustering (C-MAIKI output)
+- `pr2_version_5.1.1_SSU_mothur.fasta` — PR2 reference alignment
+- `pr2_version_5.1.1_SSU_mothur.tax` — PR2 taxonomy strings
+
+Output: a `.wang.taxonomy` file that can be read into phyloseq / dplyr in place
+of the SILVA-derived taxonomy table.
+
+
+```{bash paths, eval=FALSE}
+# ---- Paths ----
+
+# PR2 reference (where the gzipped files live, also where they unzip to)
+PR2_DIR="/Users/becca/Documents/records/database_PR2"
+PR2_FASTA="${PR2_DIR}/pr2_version_5.1.1_SSU_mothur.fasta"
+PR2_TAX="${PR2_DIR}/pr2_version_5.1.1_SSU_mothur.tax"
+
+# C-MAIKI OTU representative sequences (input)
+REP_FASTA="/Users/becca/Documents/current projects/Manuscript Storm Wali/data/processed/s18_microbial/cmaiki_pipeline/OTUs.97.rep.fasta"
+
+# Output directory for the reclassified taxonomy
+OUT_DIR="/Users/becca/Documents/current projects/Manuscript Storm Wali/data/processed/s18_microbial/pr2_alignment"
+mkdir -p "${OUT_DIR}"
+
+# mothur executable
+MOTHUR="/Applications/mothur/mothur"
+
+
+# ---- Step 1 — Decompress the PR2 reference files ----
+# Safe to re-run: skips gunzip silently if the .gz is already gone.
+[ -f "${PR2_FASTA}.gz" ] && gunzip "${PR2_FASTA}.gz"
+[ -f "${PR2_TAX}.gz" ]   && gunzip "${PR2_TAX}.gz"
+
+# Sanity check that both decompressed files exist
+ls -lh "${PR2_FASTA}" "${PR2_TAX}"
+
+
+# ---- Step 2 — Run the mothur classifier ----
+# classify.seqs parameters:
+#   reference   — PR2 reference alignment fasta
+#   taxonomy    — PR2 taxonomy strings (must match the reference)
+#   cutoff=80   — bootstrap confidence threshold (mothur default = 80)
+#   probs=F     — strip the bootstrap brackets from the taxonomy strings
+#   processors  — number of processors for mothur to use
+"${MOTHUR}" "#set.logfile(name=${OUT_DIR}/pr2_classify.logfile);
+              set.dir(output=${OUT_DIR});
+              classify.seqs(fasta=${REP_FASTA},
+                            reference=${PR2_FASTA},
+                            taxonomy=${PR2_TAX},
+                            cutoff=80,
+                            probs=F,
+                            processors=3)"
+                            
+                            rm mothur.1779804095.logfile
+```
+
+## Output files
+
+Mothur writes three files into `${OUT_DIR}`. The naming uses the last segment
+of the template fasta after the final dot, so v5.1.1 produces files prefixed
+with `OTUs.97.rep.0_SSU_mothur.wang.*`:
+
+| File | Contents |
+|---|---|
+| `OTUs.97.rep.0_SSU_mothur.wang.taxonomy` | OTU → full PR2 lineage (load this into phyloseq) |
+| `OTUs.97.rep.0_SSU_mothur.wang.tax.summary` | Hierarchical count summary across the taxonomy tree |
+| `OTUs.97.rep.0_SSU_mothur.wang.flip.accnos` | OTU IDs whose query sequence was reverse-complemented for a better hit |
+
+The `.flip.accnos` file is informational — mothur already used the reversed
+orientation for the classification. It just tells you which OTUs were
+oriented opposite to PR2's reference convention.
+

@@ -1,0 +1,417 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+## Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(dplyr)
+library(tidyr)
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+library(patchwork)
+library(ggpubr)
+library(pheatmap)
+library(dendextend)
+library(RColorBrewer)
+library(rstudioapi)
+library(ggplotify)
+
+
+# ---- File paths ----
+current_path  <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path    <- file.path(current_path, "../data/processed/s16_microbial/otu_tables")
+rds_path_1    <- file.path(current_path, "../output/figure_4_s16_alpha_beta/components")
+rds_path_2    <- file.path(current_path, "../output/figure_5_s16_taxa_response/components")
+rds_path_supp <- file.path(current_path, "../output/figure_supp5_16S_mechanisms/components")
+output_path   <- file.path(current_path, "../output")
+
+
+# ---- Shared panel theme ----
+theme_panel <- function(base_size = 10, base_family = "") {
+  theme_classic(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      # Axes
+      axis.title       = element_text(size = base_size, colour = "black"),
+      axis.title.x     = element_text(margin = margin(t = 6), face = "bold"),
+      axis.title.y     = element_text(margin = margin(r = 6), face = "bold", angle = 90),
+      axis.text        = element_text(size = base_size - 1, colour = "black"),
+      axis.line        = element_line(linewidth = 0.4, colour = "black"),
+      axis.ticks       = element_line(linewidth = 0.4, colour = "black"),
+      axis.ticks.length = unit(2, "pt"),
+
+      # Panel & plot
+      panel.background = element_rect(fill = "white", colour = NA),
+      panel.grid       = element_blank(),
+      panel.spacing    = unit(6, "pt"),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      plot.margin      = margin(4, 4, 4, 4),
+
+      # Title / subtitle / tag (tag = "A", "B" panel labels from patchwork)
+      plot.title       = element_text(size = base_size + 1, face = "bold",
+                                      hjust = 0,
+                                      margin = margin(b = 4)),
+      plot.subtitle    = element_text(size = base_size, colour = "grey30",
+                                      hjust = 0,
+                                      margin = margin(b = 4)),
+      plot.tag         = element_text(size = base_size + 2, face = "bold"),
+      plot.tag.position = c(0, 1),
+
+      # Legend (sized for collected legends via patchwork)
+      legend.background = element_rect(fill = "white", colour = NA),
+      legend.key        = element_rect(fill = "white", colour = NA),
+      legend.title      = element_text(size = base_size, face = "bold"),
+      legend.text       = element_text(size = base_size - 1),
+      legend.key.size   = unit(10, "pt"),
+      legend.spacing.y  = unit(2, "pt"),
+      legend.margin     = margin(0, 0, 0, 6),
+
+      # Facet strips
+      strip.background  = element_rect(fill = "white", colour = NA),
+      strip.text        = element_text(size = base_size, colour = "black",
+                                       face = "plain"),
+
+      complete = TRUE
+    )
+}
+```
+
+## Load & tidy phyloseq data
+```{r}
+# ---- Load normalized asv tables ----
+abund_m <- data.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_relabund_table.csv"), row.names = 1) # Count table
+  )
+tax_m <- as.matrix(
+  read.csv(file.path(input_path,"s16_asv_qc_tax_table.csv"),   row.names = 1) # Taxonomy table
+  )
+meta <- read.csv(file.path(input_path,"s16_asv_qc_sample_data.csv"), row.names = 1) # Sample data
+
+# ---- Create phyloseq object ----
+ps_rel <- phyloseq(
+  otu_table(abund_m, taxa_are_rows = T), 
+  tax_table(tax_m),
+  sample_data(meta))
+ps_rel
+
+# ---- Variable lists ----
+dm     <- c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug")
+stage  <- c("Pre","Storm","Post")
+stage2 <- c("Pre","Storm", "Post1w", "Post2w")
+site   <- c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2")
+region <- c("Kahawai","Mauka","Makai")
+pchem  <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts   <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+
+# ---- Format levels ----
+ps_rel@sam_data$DM     <- factor(ps_rel@sam_data$DM, levels = dm)
+ps_rel@sam_data$Stage  <- factor(ps_rel@sam_data$Stage, levels = stage)
+ps_rel@sam_data$Stage2 <- factor(ps_rel@sam_data$Stage2, levels = stage2)
+ps_rel@sam_data$Site   <- factor(ps_rel@sam_data$Site, levels = site)
+ps_rel@sam_data$Region <- factor(ps_rel@sam_data$Region, levels = region)
+```
+
+
+## Main figure: alpha and beta diversity
+```{r}
+
+# ---- Load ggplot objects ----
+p_q0    <- readRDS(file.path(rds_path_1, "A_q0_plot.rds"))
+p_q1    <- readRDS(file.path(rds_path_1, "A_q1_plot.rds"))
+p_q2    <- readRDS(file.path(rds_path_1, "A_q2_plot.rds"))
+arrow_scale <- 1
+p_nmds  <- readRDS(file.path(rds_path_1, "B_nmds_biplot_env.rds"))
+p_bray  <- readRDS(file.path(rds_path_1, "B_nmds_dist_to_centroid.rds"))
+
+# ---- Assemble ----
+p_A <- ggarrange(
+  p_q0 + theme_panel() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)),
+  p_q1 + theme_panel() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)),
+  p_q2 + theme_panel() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+                                axis.title.x = element_blank()),
+  labels = c("A","",""),
+  ncol = 3,
+  align = "hv"
+)
+
+p_B <- ggarrange(
+  p_nmds + theme_panel() + theme(legend.position = "bottom") + 
+    guides(fill = guide_legend(title="Date"), color = guide_legend(title="Date")),
+  p_bray + theme_panel() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)),
+  labels = c("B",""),
+  ncol = 2, widths = c(2,1),
+  align = "hv"
+)
+
+(main_1 <- ggarrange(p_A, p_B, 
+           ncol = 1, nrow = 2, align = "hv",
+           heights = c(1, 1.25)))
+
+# ---- Save plot ----
+ggsave(file.path(output_path, "figure_4_s16_alpha_beta/s16_alpha_beta.pdf"),
+       main_1, device = "pdf", width = 6, height = 6, units = "in", dpi = 1000)
+```
+
+## Heatmap
+```{r}
+# ---- Shared palettes (used by both annotation bars) ----
+date_colors <- c(`09 Jul` = "#80CDC1", `16 Jul` = "#01665E",
+                 `23 Jul` = "#8C510A", `30 Jul` = "#D8B365",
+                 `06 Aug` = "#FBBB04")
+
+fate_colors <- c("Persistent baseline" = "grey50",
+                 "Recovered"           = "#2166AC",
+                 "Storm-displaced"     = "#9CC7E0",
+                 "Storm-introduced"    = "#B2182B",
+                 "Storm-transient"     = "#EF8A62",
+                 "Post-storm arrival"  = "#FDDBC7")
+
+# ---- 1. Agglomerate to genus and label taxa ----
+ps_genus <- tax_glom(ps_rel, taxrank = "Genus", NArm = FALSE)
+
+tax         <- as(tax_table(ps_genus), "matrix")
+rank_cols   <- c("Genus", "Family", "Order", "Class", "Phylum")
+rank_abbrev <- c("G", "F", "O", "C", "P")
+
+genus_labels <- sapply(seq_len(nrow(tax)), function(i) {
+  for (j in seq_along(rank_cols)) {
+    val <- tax[i, rank_cols[j]]
+    if (!is.na(val) && val != "" &&
+        !grepl("unclassified|uncultured", val, ignore.case = TRUE)) {
+      if (j == 1) return(val)
+      return(paste0(val, " (", rank_abbrev[j], ")"))
+    }
+  }
+  "Unclassified Bacteria"
+})
+taxa_names(ps_genus) <- make.unique(genus_labels)
+
+# ---- 2. Extract genus-level OTU table (taxa as rows) ----
+otu_full <- as.data.frame(otu_table(ps_genus))
+if (!taxa_are_rows(ps_genus)) otu_full <- t(otu_full)
+
+# ---- 3. Filter to top-N classified genera ----
+classified <- !grepl("unclassified|uncultured|Unclassified Bacteria|\\(F\\)|\\(O\\)|\\(C\\)|\\(P\\)",
+                     taxa_names(ps_genus), ignore.case = TRUE)
+otu_classified <- otu_full[classified, ]
+cat("Classified genera represent",
+    round(sum(colSums(otu_classified)) / sum(colSums(otu_full)) * 100, 1),
+    "% of total relative abundance\n")
+
+top_n    <- 45
+top_taxa <- names(sort(rowMeans(otu_classified), decreasing = TRUE))[1:top_n]
+otu_top  <- otu_classified[top_taxa, ]
+
+cat("Top", top_n, "displayed genera represent",
+    round(sum(otu_top) / sum(otu_full) * 100, 1),
+    "% of total relative abundance\n")
+
+# ---- 4. Per-genus dominant ASV fate (by summed mean abundance) ----
+asv_fate <- read.csv(file.path(output_path, "disturbance_response/s16_asv_fates.csv"),
+                     stringsAsFactors = FALSE)
+
+asv_tax <- as.data.frame(as(tax_table(ps_rel), "matrix"))
+asv_otu <- as.data.frame(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) asv_otu <- t(asv_otu)
+
+genus_fate <- data.frame(
+    ASV_ID     = rownames(asv_tax),
+    Genus      = asv_tax$Genus,
+    Mean_Abund = rowMeans(asv_otu)[rownames(asv_tax)],
+    stringsAsFactors = FALSE) %>%
+  dplyr::left_join(asv_fate, by = "ASV_ID") %>%
+  dplyr::filter(!is.na(Genus), !is.na(Fate)) %>%
+  dplyr::group_by(Genus, Fate) %>%
+  dplyr::summarise(Sum_Abund = sum(Mean_Abund), .groups = "drop") %>%
+  dplyr::group_by(Genus) %>%
+  dplyr::slice_max(Sum_Abund, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Genus, Fate)
+
+# Strip any make.unique suffixes (.1, .2, …) before matching genus labels
+top_taxa_clean <- sub("\\.[0-9]+$", "", top_taxa)
+genus_fate_vec <- setNames(
+  genus_fate$Fate[match(top_taxa_clean, genus_fate$Genus)],
+  top_taxa
+)
+if (any(is.na(genus_fate_vec))) {
+  warning(sum(is.na(genus_fate_vec)), " of the top ", length(top_taxa),
+          " genera could not be assigned a fate; check ASV–fate join.")
+}
+
+# ---- 5. Log10 transform with pseudocount ----
+pseudocount <- min(otu_top[otu_top > 0]) / 2
+otu_log <- log10(otu_top + pseudocount)
+
+# Optional row-wise z-score (currently disabled — heatmap shows log values directly)
+# otu_z <- t(scale(t(otu_log)))
+otu_z <- otu_log
+
+zmax   <- max(abs(otu_z))
+breaks <- seq(-zmax, zmax, length.out = 101)   # ascending, centered on 0
+color  <- colorRampPalette(c("#4D4D4D", "white", "#D53E4F"))(100)
+
+# ---- 6. Cluster taxa, then flip so Storm-transient genera land at the bottom ----
+taxa_clust <- hclust(dist(otu_z, method = "euclidean"), method = "ward.D2")
+taxa_clust <- as.hclust(rev(as.dendrogram(taxa_clust)))    # ← row reversal
+
+# ---- 7. Cluster samples on full community, rotate to chronological order ----
+sample_clust <- hclust(vegdist(t(otu_full), method = "bray"), method = "ward.D2")
+
+samp        <- data.frame(sample_data(ps_genus))
+sample_dend <- as.dendrogram(sample_clust)
+labels(sample_dend) <- samp[labels(sample_dend), "Desc_Sample_ID"]
+
+date_lookup    <- setNames(as.character(samp$DM), samp$Desc_Sample_ID)
+current_labels <- labels(sample_dend)
+desired_order  <- current_labels[
+  order(factor(date_lookup[current_labels],
+               levels = c("09 Jul", "16 Jul", "30 Jul", "06 Aug", "23 Jul")))]
+sample_clust   <- as.hclust(rotate(sample_dend, desired_order))
+
+# Match the matrix column names to the rotated dendrogram leaves
+colnames(otu_z) <- samp[colnames(otu_z), "Desc_Sample_ID"]
+
+# ---- 8. Annotation data frames ----
+annot_col <- data.frame(Date = factor(samp$DM, levels = names(date_colors)))
+rownames(annot_col) <- samp$Desc_Sample_ID
+
+annot_row <- data.frame(Fate = factor(genus_fate_vec, levels = names(fate_colors)))
+rownames(annot_row) <- top_taxa
+
+ann_colors <- list(Date = date_colors, Fate = fate_colors)
+
+# ---- 9. Heatmap ----
+(heat <- pheatmap(otu_z,
+  cluster_rows      = taxa_clust,
+  cluster_cols      = sample_clust,
+  scale             = "none",
+  breaks = seq(min(otu_z), max(otu_z), length.out = 101),   # ascending: min → max
+  color  = colorRampPalette(c("#4D4D4D", "white", "#D53E4F"))(100),
+  annotation_col    = annot_col,
+  annotation_row    = annot_row,
+  annotation_colors = ann_colors,
+  show_colnames     = FALSE,
+  fontsize_col      = 6,
+  angle_col         = 90,
+  fontsize_row      = 8,
+  fontface_row      = "italic",
+  border_color      = "grey90",
+  main              = ""
+))
+
+# ---- Save legend ----
+pdf(file.path(output_path, "figure_5_s16_taxa_response/s16_heatmap_legend.pdf"), width = 8, height = 10)
+grid::grid.newpage()
+grid::grid.draw(heat$gtable)
+dev.off()
+
+# ---- Plot without legend ----
+phmap_noleg <- pheatmap(otu_z,
+  cellwidth   = 7,
+  cellheight  = 7,
+  cluster_rows      = taxa_clust,
+  cluster_cols      = sample_clust,
+  scale             = "none",
+  breaks = seq(min(otu_z), max(otu_z), length.out = 101),   # ascending: min → max
+  color  = colorRampPalette(c("#4D4D4D", "white", "#D53E4F"))(100),
+  annotation_col    = annot_col,
+  annotation_row    = annot_row,
+  annotation_colors = ann_colors,
+  show_colnames     = FALSE,
+  fontsize_col      = 6,
+  angle_col         = 90,
+  fontsize_row      = 7,
+  fontface_row      = "italic",
+  border_color      = "grey90",
+  legend            = FALSE,   # drops the colour scale legend
+  annotation_legend = FALSE
+)
+```
+**Methods:** To visualize temporal shifts in bacterial community composition, a heatmap was constructed from genus-level relative abundances. ASVs were agglomerated to genus level using tax_glom (phyloseq; McMurdie and Holmes 2013), retaining taxa classified to at least genus level (328 genera). The 45 most abundant classified genera by mean relative abundance were selected for display, collectively representing 67.2% of total community relative abundance and 96% of all ASVs classified to the genus level. Relative abundances were log₁₀-transformed using a pseudocount equal to half the minimum nonzero value in the filtered matrix, then z-scored by row (genus) to enable comparison of temporal patterns across genera with differing baseline abundances. Sample-level hierarchical clustering was performed on Bray-Curtis dissimilarities computed from the full genus-level community (all classified and unclassified genera) using Ward's minimum variance method (ward.D2), such that the dendrogram reflects whole-community similarity rather than only the displayed taxa. Genus-level clustering was performed on Euclidean distances of the z-scored matrix using Ward's method. Dendrogram nodes were rotated to arrange samples chronologically from pre-storm (left) to storm (right) without altering the clustering topology (dendextend; Galili 2015). The heatmap was generated using pheatmap (Kolde 2019) with a diverging black–white–red color scale, where black indicates z-scores below the genus mean (relative depletion) and red indicates z-scores above (relative enrichment).
+
+**Results:** Hierarchical clustering of samples based on whole-community Bray-Curtis dissimilarities grouped samples primarily by sampling date, with storm samples (23 Jul) forming a distinct cluster separated from all pre- and post-storm dates. Pre-storm samples (9 Jul, 16 Jul) clustered together, as did post-storm samples (30 Jul, 6 Aug), with a small number of pre-storm samples grouping with the post-storm cluster. Among the top 45 classified genera, two broad patterns were evident. A subset of genera were enriched during the storm relative to their temporal means, many of which were depleted or near their mean abundances on pre-storm dates. Conversely, genera characteristic of the pre-storm community were strongly depleted during the storm. Post-storm communities showed partial recovery toward pre-storm composition, though several storm-associated genera remained moderately enriched on 30 Jul and 6 Aug.
+
+
+## Main figure: taxa response
+```{r}
+# ---- Load ggplots ---
+p_bar    <- readRDS(file.path(rds_path_2, "A_asv_fates_bar.rds"))
+p_dot    <- readRDS(file.path(rds_path_2, "B_asv_fates_dot.rds"))
+p_heat   <- as.ggplot(phmap_noleg)
+
+# ---- Extract legends ---
+leg <- ggarrange(
+  as.ggplot(get_legend(p_nmds + theme_panel())),
+  as.ggplot(get_legend(p_bar + theme_panel() + guides(fill = guide_legend(reverse = TRUE)))),
+  as.ggplot(get_legend(p_dot + theme_panel())),
+  as.ggplot(gtable::gtable_filter(heat$gtable, "legend")),
+  ncol = 4, widths = c(1,1,1,2)
+)
+
+# ---- Save legend ----
+ggsave(file.path(output_path, "figure_5_s16_taxa_response/s16_taxa_response_legend.pdf"),
+       leg, device = "pdf", width = 6, height = 4, units = "in", dpi = 1000)
+
+# ---- Assemble plot ---
+left_col <- ggarrange(
+    p_bar + theme_panel() +
+      theme(
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank()),
+    p_dot + theme_panel() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+      theme(legend.position = "none"),
+    ncol = 1, nrow = 2, align = "v",
+    labels = c("A","B"), heights = c(1,2))
+
+(main_2 <- ggarrange(
+  left_col,
+  p_heat, 
+  ncol = 2, nrow = 1, align = "hv", widths = c(1.5, 2.5),
+  labels = c("","C")
+))
+
+
+
+# ---- Save plot ----
+ggsave(file.path(output_path, "figure_5_s16_taxa_response/s16_taxa_response.pdf"),
+       main_2, device = "pdf", width = 12, height = 6, units = "in", dpi = 1000)
+```
+
+## Supplemental figure
+```{r}
+# ---- Load ggplots ---
+A_procustes_resids <- readRDS(file.path(rds_path_supp, "A_procustes_resids.rds"))
+B_jaccard_dissim   <- readRDS(file.path(rds_path_supp, "B_jaccard_dissim.rds"))
+C_asv_traj         <- readRDS(file.path(rds_path_supp, "C_asv_trajectories.rds"))
+
+# ---- Assemble plot ---
+top_row <- ggarrange(
+  A_procustes_resids,
+  B_jaccard_dissim,
+  ncol = 2, nrow = 1, widths = c(1,2.5)
+)
+
+(supp <- ggarrange(top_row,
+                  C_asv_traj,
+                  ncol = 1, nrow = 2, heights = c(1,1.5),
+                  align = "hv"))
+
+# ---- Save plot ----
+ggsave(file.path(output_path, "figure_supp5_16S_mechanisms/s16_mechanisms.pdf"),
+       supp, device = "pdf", width = 6, height = 7, units = "in", dpi = 1000)
+```
+
+
+
+

@@ -1,0 +1,214 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 0. Setup
+```{r setup, message=FALSE}
+# ---- Clear the environment ----
+rm(list=ls())
+
+# ---- Load libraries ----
+library(readr)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(phyloseq)
+library(ggplot2)
+library(scales)
+library(rstudioapi)
+library(microbiome)
+
+
+# ---- File paths ---- 
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+input_path   <- file.path(current_path, "../data/processed/s18_microbial/cmaiki_pipeline")
+output_path  <- file.path(current_path, "../data/processed/s18_microbial/otu_tables")
+```
+
+## 1. Load & tidy sample data
+```{r}
+# ---- Count table ----
+count <- as.data.frame(read_delim(file.path(input_path,"OTUs.97.rep.count_table"), show_col_types = F)) 
+rownames(count) = count$Representative_Sequence # Set row names
+count[,-c(1,2)] # Preview
+count_m = data.matrix(count[,-c(1,2)]) # Convert to matrix
+
+
+# ---- Taxonomy table ----
+tax <- as.data.frame(
+  read_delim(
+    file.path(input_path, "../pr2_alignment/OTUs.97.rep.1_SSU_mothur.wang.taxonomy"), 
+    "\t", col_names = F, show_col_types = F))
+tax2 <- suppressWarnings(tax %>%  # Delimit taxonomy column
+  separate(
+    col = X2, 
+    into = c("Domain","Supergroup","Division","Subdivision","Class","Order","Family","Genus","Species"),
+    sep = ";", remove = T)) # Remove original column
+for (c in 1:dim(tax2)[2]) {
+  for (r in 1:dim(tax2)[1]) {
+    tax2[r,c] <- str_replace_all(tax2[r,c], "_", " ")                  # underscores → spaces
+    tax2[r,c] <- str_replace_all(tax2[r,c], "(?<=^| )X+(?= |$)", "")   # drop standalone X / XX / XXX placeholders
+    tax2[r,c] <- str_replace_all(tax2[r,c], "  +", " ")                # collapse any double spaces left behind
+    tax2[r,c] <- str_trim(tax2[r,c])                                   # trim leading/trailing whitespace
+  }
+}
+rownames(tax2) = tax2$X1 # Set row names
+tax2[,-c(1)] # Preview
+tax2_m = as.matrix(tax2[,-c(1)]) # Convert to matrix
+
+
+# ---- Sample data ----
+meta_df <- as.data.frame(
+  read_delim(
+    file.path(input_path, "../../physicochemistry/sample_data_qc_imputed.csv"),
+    show_col_types = F))
+meta_df <- meta_df[!is.na(meta_df$"Lane_Sample_ID_18S"), ] # Exclude non-16S samples
+rownames(meta_df) = meta_df$Lane_Sample_ID_18S # Set rownames
+pchem <- c("S_Temp_C","S_Salinity_ppt","S_DO_mgL","S_pH","Turb_FAU") # physicochemical variable column names
+nuts  <- c("NO3_uM","NO2_uM","NH3_uM","PO4_uM","SiO2_uM") # Nutrient variable column names
+meta_df # Preview
+
+```
+
+## 2. Generate phyloseq object
+```{r}
+# ---- Create phyloseq object ----
+ps_count <- phyloseq(
+  otu_table(count_m, taxa_are_rows = T), 
+  tax_table(tax2_m),
+  sample_data(meta_df))
+
+sample_names(sample_data(meta_df)) %in% sample_names(otu_table(count_m, taxa_are_rows = T))
+
+# ---- Format variables ----
+# Specify date groups
+pre_dates  <- c("09 Jul","16 Jul")
+storm_date <- "23 Jul"
+post_dates <- c("30 Jul","06 Aug")
+post1_date <- "30 Jul"
+post2_date <- "06 Aug"
+
+# Recode DM values to canonical labels
+ps_count@sam_data$DM <- format(as.Date(as.character(sample_data(ps_count)$Microbe_Date), format = "%Y%m%d"), "%d %b")
+Stage <- ps_count@sam_data$DM
+Stage[Stage %in% pre_dates]    <- "Pre"
+Stage[Stage %in% storm_date]   <- "Storm"
+Stage[Stage %in% post_dates]   <- "Post"
+Stage2 <- ps_count@sam_data$DM
+Stage2[Stage2 %in% pre_dates]  <- "Pre"
+Stage2[Stage2 %in% storm_date] <- "Storm"
+Stage2[Stage2 %in% post1_date] <- "Post1w"
+Stage2[Stage2 %in% post2_date] <- "Post2w"
+
+# Set phyloseq metadata factor levels
+ps_count@sam_data$DM <- factor(ps_count@sam_data$DM, levels = c("09 Jul","16 Jul","23 Jul","30 Jul","06 Aug"))
+ps_count@sam_data$Stage <- factor(Stage, levels = c("Pre","Storm","Post"))
+ps_count@sam_data$Stage2 <- factor(Stage2, levels = c("Pre","Storm", "Post1w", "Post2w"))
+ps_count@sam_data$Site <- factor(ps_count@sam_data$Site, levels = c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","OM2"))
+ps_count@sam_data$Region <- factor(ps_count@sam_data$Region, levels = c("Kahawai","Mauka","Makai"))
+data.frame(ps_count@sam_data) 
+
+# Preview
+ps_count
+```
+## 3. Subset
+```{r}
+# ---- Filter dates to Storm Wali ----
+ps_count <- subset_samples(ps_count, Microbe_Date %in% c(20140709,20140716,20140723,20140730,20140806))
+ps_count
+
+# ---- Summarize total number of reads ----
+print(paste("Total reads:", comma (sum(taxa_sums(ps_count))))) 
+```
+## 4. Filter
+```{r}
+# ---- Sample quality filter ----
+ps_count_filt <- prune_samples(
+  sample_names(ps_count) != "lane1_s008_index_CACGGTTGTGAG_HFP_20140709_P7_S8_L001", # failed sample
+  ps_count) 
+
+# ---- Bacteria filter ----
+ps_count_filt <- subset_taxa(
+  ps_count_filt, 
+  Subdivision!="Proteobacteria X") # Remove bacteria sequences (because this is 18S)
+ps_count_filt # Preview
+
+# ---- Unknown filter ----
+ps_count_filt <- subset_taxa(ps_count_filt, Supergroup!="Eukaryota unclassified")
+ps_count_filt <- subset_taxa(ps_count_filt, Supergroup!="unknown unclassified")
+
+# ---- Remove nucleomorphs ---- 
+# Cryptists possess a tiny, highly reduced remnant nucleus trapped between the membranes of their chloroplasts, an evolutionary remains of a red alga endosymbiont that is wholely distinct from the Cryptista 18S gene
+ps_count_filt <- subset_taxa(ps_count_filt, Supergroup!="Cryptista:nucl")
+ps_count_filt
+
+# ---- Remove metazoa ---- 
+ps_count_filt <- subset_taxa(ps_count_filt, Subdivision!="Metazoa")
+ps_count_filt
+
+# ---- Remove multicellular red algae ---- 
+ps_count_filt <- subset_taxa(ps_count_filt, Class!="Florideophyceae")
+ps_count_filt
+
+# ---- Abundance filter ----
+ps_count_filt <- filter_taxa(ps_count_filt, function(x) max(x) >= 10, TRUE) # Remove OTUs with counts <10X the detection threshold
+ps_count_filt
+
+# ---- Prevalence filter ----
+#ps_count_filt <- filter_taxa(ps_count_filt, function(x) sum(x > 0) >= 3, TRUE) # Remove OTUs not present in at least 3 samples
+
+# ---- Summarize total number of reads ----
+print(paste("Total reads:", comma (sum(taxa_sums(ps_count_filt)))))
+```
+## 5. Transform
+```{r}
+# ---- Calculate relative abundances ----
+ps_rel <- transform_sample_counts(ps_count_filt, function(x) x / sum(x) )
+ps_rel
+```
+## 6. Subsample
+```{r}
+# Explore subsampling levels
+samp_sums <- as.data.frame(sample_sums(ps_count_filt)); colnames(samp_sums) = c("sums")
+subsample <- 2987
+
+# Plot sequence distribution
+samp_sums$keep <- samp_sums$sums >= subsample
+ggplot(samp_sums, aes(x=sample_sums(ps_count_filt))) + 
+  geom_histogram(aes(fill = keep), color = "black") + 
+  scale_fill_manual(values = c("white","darkgrey")) + 
+  theme_minimal() +
+  scale_x_continuous(transform = "log10") +
+  labs(title = paste("Subsample level:", subsample, "reads."))
+
+# Print sample names and sample sums below a ps_count_filt level
+sample_sums(ps_count_filt)[sample_sums(ps_count_filt)<subsample]
+
+# Subsample
+ps_count_norm <- rarefy_even_depth(ps_count_filt, sample.size = subsample, replace=F, rngseed = 321) # Seed creates reproduceability
+ps_count_norm
+
+# Summarize total number of reads
+print(paste("The total number of rarified reads is ", comma (sum(taxa_sums(ps_count_norm)))))
+```
+
+
+## 7. Export OTU tables
+```{r}
+# ---- Non-normalized ASV table ----
+write.csv(data.frame(otu_table(ps_count_filt)),   file.path(output_path,"s18_otu_qc_count_table.csv")) # Count table
+write.csv(data.frame(otu_table(ps_rel)),          file.path(output_path,"s18_otu_qc_relabund_table.csv")) # Relative abundance table
+write.csv(data.frame(tax_table(ps_rel)),          file.path(output_path,"s18_otu_qc_tax_table.csv")) # Taxonomy table
+write.csv(data.frame(sample_data(ps_rel)),        file.path(output_path,"s18_otu_qc_sample_data.csv")) # Sample table
+write.csv(data.frame(psmelt2(ps_rel)),            file.path(output_path,"s18_otu_qc_long_table.csv")) # Melted table
+
+# ---- Normalized otu table ----
+write.csv(data.frame(otu_table(ps_count_norm)),   file.path(output_path,"s18_otu_rarefied_count_table.csv")) # Count table
+write.csv(data.frame(tax_table(ps_count_norm)),   file.path(output_path,"s18_otu_rarefied_tax_table.csv")) # Taxonomy table
+write.csv(data.frame(sample_data(ps_count_norm)), file.path(output_path,"s18_otu_rarefied_sample_data.csv")) # Sample data
+write.csv(data.frame(psmelt2(ps_count_norm)),     file.path(output_path,"s18_otu_rarefied_long_table.csv")) # Melted table
+```
+

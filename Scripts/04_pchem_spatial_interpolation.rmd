@@ -1,0 +1,919 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Set up the environment
+```{r}
+# ---- Clear the environment ----
+rm(list=ls()) # optional
+
+# ---- Load libraries ----
+library(readr)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(ggplot2)
+library(ggpubr)
+
+# ---- Set file paths ----
+folder_path <- "/Users/becca/Documents/current projects/Manuscript Storm Wali" # Folder location
+input_path  <- file.path(folder_path, "data") # Where to find input files
+output_path <- file.path(folder_path, "output") # Where to save output files
+
+# ----Input data ----
+meta <- read_csv(file.path(input_path, "processed/physicochemistry/sample_data_qc_imputed.csv"),
+                    show_col_types = FALSE)[,-c(1)]
+```
+
+
+# Spatial interpolation with IDW
+## Load coordinate and shapefile data
+```{r}
+# ---- Load sample site coordinates ----
+site_coord <- read_csv(
+  file.path(input_path, "raw/geography/gps_sites_p1-p10.csv"),
+  show_col_types = FALSE
+)
+colnames(site_coord) <- c("Site", "y", "x")
+site_coord$Region <- c("Mauka", "Mauka", "Kahawai", "Kahawai", "Kahawai",
+                       "Mauka", "Kahawai", "Makai", "Makai", "Mauka")
+
+makaha_coord <- read_csv(
+  file.path(input_path, "raw/geography/gps_sites_makaha.csv"),
+  show_col_types = FALSE
+) %>%
+  filter(Site != "RM1") # Remove RM1 (not present in 2014)
+colnames(makaha_coord) <- c("Site", "y", "x")
+
+# ---- Join coordinates to metadata ----
+meta_xy <- meta %>%
+  left_join(site_coord, by = "Site") %>%
+  filter(!is.na(x), !is.na(y))
+
+meta_xy <- meta_xy %>%
+  mutate(
+    Date = if_else(
+      Date == as.Date("2014-07-24"),
+      as.Date("2014-07-23"),
+      Date
+    )
+  )
+
+# ---- Load shapefiles ----
+hfp_total_area  <- read_sf(file.path(input_path, "raw/geography/shape_hfp_2014-2015.shp"))
+mangrove_island <- read_sf(file.path(input_path, "raw/geography/shape_mangrove_island.shp"))
+hfp_p_sites     <- read_sf(file.path(input_path, "raw/geography/shape_p_site_bounds.shp"))
+
+# ---- Preview geometry ----
+ggplot() +
+  geom_sf(data = hfp_total_area, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = hfp_p_sites, fill = "grey80", color = "black", linewidth = 0.25) +
+  geom_sf(data = mangrove_island, fill = "grey95", color = "black", linewidth = 0.25) +
+  geom_point(data = meta_xy, aes(x = x, y = y), size = 1) +
+  geom_point(data = makaha_coord, aes(x = x, y = y), size = 2, color = "white", shape = 15) +
+  coord_sf()
+```
+
+## Calculate interpolations
+```{r}
+# ---- Lists to iterate over ----
+d_list <- c(
+  "2014-07-07", # pre-storm
+  "2014-07-09",
+  "2014-07-14",
+  "2014-07-16",
+  "2014-07-21", # storm
+  "2014-07-23",
+  "2014-07-29", # post-storm
+  "2014-07-30",
+  "2014-08-06",
+  "2014-08-11"
+)
+
+v_list <- c(
+  "S_Temp_C","B_Temp_C",
+  "S_Salinity_ppt","B_Salinity_ppt",
+  "S_DO_mgL","B_DO_mgL",
+  "S_pH","B_pH",
+  "tin_t","NO3_uM_t","NO2_uM_t","NH3_uM_t",
+  "PO4_uM_t","SiO2_uM_t","Turb_FAU_t",
+  "tin_to_tip_t","tin_to_sil_t","sil_to_sal_t"
+)
+
+l_list <- c(
+  "temp","temp",
+  "sal","sal",
+  "do","do",
+  "ph","ph",
+  "logtin","logNO3","logNO2","logNH3",
+  "logPO4","logSiO2","logTurb",
+  "logtintip","logtinsio2","logsio2sal"
+)
+
+# ---- Polygon mask for interpolation ----
+mask_poly <- hfp_total_area %>%
+  st_make_valid() %>%
+  st_union() %>%
+  st_as_sf()
+
+# ---- Create interpolation grid ----
+cellsize <- 0.000007
+
+grid_sf <- st_make_grid(
+  mask_poly,
+  cellsize = cellsize,
+  what = "centers"
+) %>%
+  st_as_sf()
+
+grid_sf <- grid_sf[st_within(grid_sf, mask_poly, sparse = FALSE), ]
+st_crs(grid_sf) <- 4326
+
+# ---- Interpolation function ----
+calc_idw <- function(meta_xy, d, v, l, grid_sf, idp = 2, min_n = 3) {
+  df <- meta_xy %>%
+    filter(Date == as.Date(d)) %>%
+    select(Site, x, y, value = all_of(v)) %>%
+    filter(!is.na(value))
+  if (nrow(df) < min_n) return(NULL)
+  pts_sf <- st_as_sf(df, coords = c("x", "y"), crs = 4326)
+  hull <- st_convex_hull(st_union(pts_sf))
+  grid_use <- grid_sf[st_within(grid_sf, hull, sparse = FALSE), ]
+  if (nrow(grid_use) == 0) return(NULL)
+  idw_out <- gstat::idw(
+    value ~ 1,
+    locations = pts_sf,
+    newdata   = grid_use,
+    idp       = idp
+  )
+  idw_out %>%
+    mutate(
+      d = d,
+      v = v,
+      quick_ref = l
+    )
+}
+
+idw_res_list <- list()
+k <- 1
+
+for (i in seq_along(v_list)) {
+  for (j in seq_along(d_list)) {
+
+    out <- calc_idw(
+      meta_xy = meta_xy,
+      d = d_list[j],
+      v = v_list[i],
+      l = l_list[i],
+      grid_sf = grid_sf
+    )
+
+    if (!is.null(out)) {
+      idw_res_list[[k]] <- out
+      k <- k + 1
+    }
+  }
+}
+
+idw_res <- bind_rows(idw_res_list)
+```
+
+# Plot interpolations
+```{r}
+# ---- Set latitude and Longitude breaks ----
+lat_breaks <- c(21.433, 21.435, 21.437, 21.439) # Latitude breaks (y-axis): °N"
+long_breaks <- c(-157.806, -157.808, -157.810) # Longitude breaks (x-axis): °W"
+
+# ---- Plot single panel (one date, one layer, one variable) ----
+plot_idw <- function(idw_sf_one, breaks, labels = NULL,
+                     linewidth = 0.5) {
+
+  stopifnot(inherits(idw_sf_one, "sf"))
+  if (is.null(labels)) labels <- breaks
+
+  lims <- range(c(idw_sf_one$var1.pred, breaks), na.rm = TRUE)
+
+  # Extract coordinates from sf geometry
+  xy <- sf::st_coordinates(idw_sf_one)
+
+  df_grid <- idw_sf_one %>%
+    sf::st_drop_geometry() %>%
+    dplyr::mutate(x = xy[, 1], y = xy[, 2]) %>%
+    dplyr::select(x, y, var1.pred)
+
+  # Plot 
+  p <- ggplot() +
+    
+    # Add fishpond border
+    geom_sf(data = hfp_total_area, fill = NA, color = "black", linewidth = 0.5) + # Simple feature object
+    
+    # Add variable color gradient
+    geom_raster(data = df_grid, aes(x = x, y = y, fill = var1.pred), interpolate = TRUE) + # Raster object
+    
+  scale_fill_gradientn(
+      colors = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+      limits = lims,
+      breaks = breaks,
+      labels = labels,
+      na.value = NA
+    ) +
+    
+    # Add mangrove island
+    geom_sf(data = mangrove_island, fill = "grey95", color = "black", linewidth = 0.5) + # Simple feature object
+    
+    # Coordinate settings
+    scale_x_continuous(breaks = long_breaks) + # Longitude
+    scale_y_continuous(breaks = lat_breaks) + # Latitude
+    
+    # Add site points
+    geom_point(data = makaha_coord, aes(x = x, y = y), size = 2, color = "white", shape = 18) + # makaha
+    geom_point(data = site_coord, aes(x = x, y = y, shape = Region), size = 1.5, color = "black") + # sampling sites
+    scale_shape_manual(values = c("Kahawai"= 1, "Makai" = 0, "Mauka" = 2), guide = "none") +
+    
+    # Other aesthetics
+    theme_minimal() +
+    theme(
+      axis.title = element_blank(),
+      axis.text  = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.ticks = element_line(linewidth = 0.5),
+      axis.ticks.length = unit(6, "pt"),
+      plot.margin = margin(0, 0, 0, 0, "cm")
+    )
+}
+
+# ---- Extract and save legend ----
+plot_idw_legend <- function(idw_sf_one, breaks, labels = NULL, title,
+                            barheight = 4.5) {
+
+  if (is.null(labels)) labels <- breaks
+
+  # Build a "real" plot (but we will only KEEP the legend)
+  p_for_leg <- plot_idw(
+    idw_sf_one = idw_sf_one,
+    breaks = breaks,
+    labels = labels
+    ) + 
+  
+  # Legend aesthetics
+    guides(fill = guide_colorbar(
+      title = title,
+      title.position = "left",
+      title.hjust = 0.5,
+      label.position = "right",
+      barwidth = 0.5,
+      barheight = barheight,
+      ticks = TRUE,
+      ticks.colour = "black",
+      ticks.linewidth = 0.5,
+      frame.colour = "black",
+      frame.linewidth = 0.5
+    )) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(angle = 90, face = "bold", size = 20),
+      legend.text  = element_text(size = 20),
+      legend.ticks.length = unit(0.5, "mm")
+    )
+
+  # Extract ONLY the legend (no plotting panel)
+  ggpubr::as_ggplot(ggpubr::get_legend(p_for_leg))
+}
+
+# ---- Dates to plot ----
+d_list <- c(
+  "2014-07-09", # pre-storm
+  "2014-07-16",
+  "2014-07-23", # storm
+  "2014-07-30", # post-storm
+  "2014-08-06"
+)
+
+# ---- Build the multi-date panel (surface + optional bottom) + legend ----
+plot_shm <- function(quick_ref,
+                     breaks,
+                     labels = NULL,
+                     title,
+                     n_dates = length(d_list)) {
+
+  df <- idw_res %>% dplyr::filter(quick_ref == !!quick_ref)
+
+  if (nrow(df) == 0) stop("No IDW results found for quick_ref = ", quick_ref)
+
+  # Detect whether this quick_ref includes S_ and B_ layers
+  has_S <- any(substr(df$v, 1, 2) == "S_")
+  has_B <- any(substr(df$v, 1, 2) == "B_")
+
+  # If no S_/B_ prefix exists (e.g., nutrients), treat as single-layer
+  # and label it like "Surface" would have been.
+  single_layer <- !(has_S || has_B)
+
+  make_row <- function(layer_prefix = NULL) {
+    row_plots <- vector("list", length = n_dates)
+
+    for (k in seq_len(n_dates)) {
+      this_date <- d_list[k]
+
+      if (single_layer) {
+        one <- df %>% dplyr::filter(d == this_date)
+      } else {
+        one <- df %>% dplyr::filter(d == this_date, substr(v, 1, 2) == layer_prefix)
+      }
+
+      if (nrow(one) == 0) {
+        # blank tile if missing
+        row_plots[[k]] <- ggplot() + theme_void() + coord_sf()
+      } else {
+        row_plots[[k]] <- plot_idw(
+          idw_sf_one = one,
+          breaks = breaks,
+          labels = labels,
+        ) + theme(legend.position = "none")
+      }
+    }
+
+    ggpubr::ggarrange(plotlist = row_plots, ncol = n_dates, nrow = 1, align = "hv")
+  }
+
+  # Build rows
+  p_surface <- make_row("S_")
+  p_bottom  <- if (has_B) make_row("B_") else NULL
+
+  # Add left-side labels if we truly have two layers
+  if (!single_layer && has_S) {
+    p_surface <- ggpubr::annotate_figure(
+      p_surface,
+      left = ggpubr::text_grob("Surface", rot = 90, vjust = 0.5, size = 20)
+    )
+  }
+  if (!single_layer && has_B) {
+    p_bottom <- ggpubr::annotate_figure(
+      p_bottom,
+      left = ggpubr::text_grob("Bottom", rot = 90, vjust = 0.5, size = 20)
+    )
+  }
+
+  # Stack rows
+  panels_plot <- if (!is.null(p_bottom)) {
+    ggpubr::ggarrange(p_surface, p_bottom, ncol = 1, nrow = 2, align = "hv")
+  } else {
+    p_surface
+  }
+
+  # Legend: use first available non-empty slice to set scale + legend
+  legend_df <- df %>% dplyr::filter(d == d_list[1])
+  if (!single_layer) {
+    if (has_S) legend_df <- legend_df %>% dplyr::filter(substr(v, 1, 2) == "S_")
+    if (nrow(legend_df) == 0 && has_B) legend_df <- df %>% dplyr::filter(d == d_list[1], substr(v, 1, 2) == "B_")
+  }
+  if (nrow(legend_df) == 0) legend_df <- df[1, , drop = FALSE]
+
+  barheight <- if (!single_layer && has_B) 9 else 4.5
+
+  legend_plot <- plot_idw_legend(
+    idw_sf_one = legend_df,
+    breaks = breaks,
+    labels = labels,
+    title = title,
+    barheight = barheight
+  )
+
+  list(panels_plot, legend_plot)
+}
+
+assemble_panels <- function(plot_list, w = c(1,4)) {
+  ggpubr::ggarrange(plot_list[[2]], plot_list[[1]], ncol = 2, widths = w)
+}
+```
+
+## Summarize interpolated data
+```{r}
+# ---- Quick summary of ranges for scaling ----
+idw_res %>%
+  group_by(quick_ref) %>%
+  summarize(
+    min_value = min(var1.pred, na.rm = TRUE),
+    max_value = max(var1.pred, na.rm = TRUE)
+  )
+```
+
+## YSI Sonde spatial heatmaps
+Dates (left to right): 9 July, 16 July, 23 July, 30 July, 6 August
+```{r}
+# Temperature
+shm_temp <- plot_shm(
+  quick_ref = "temp", 
+  breaks = c(24, 26, 28, 30), 
+  title = expression(bold(Temp.~(degree*C)))
+  ); (shm_temp_w_leg <- assemble_panels(shm_temp))
+
+# Salinity
+shm_sal <- plot_shm(
+  quick_ref = "sal", 
+  breaks = c(0, 7, 14, 21, 28, 35), 
+  title = expression(bold(Salinity~(PSU)))
+  ); (shm_sal_w_leg <- assemble_panels(shm_sal))
+
+# DO
+shm_do <- plot_shm(
+  quick_ref = "do", 
+  breaks = c(4, 6, 8, 10), 
+  title = expression(bold(DO~(mg~L^{-1})))
+  ); (shm_do_w_leg <- assemble_panels(shm_do))
+
+# pH
+shm_ph <- plot_shm(
+  quick_ref = "ph", 
+  breaks = c(7, 7.4, 7.8, 8.2, 8.6), 
+  title = expression(bold(pH))
+  ); (shm_ph_w_leg <- assemble_panels(shm_ph))
+```
+
+## Hach kit spatial heatmaps
+Note: Variables are y = log10(x+1) transformed, so scale labels are back-calculated 10^(y) - 1.
+Dates (left to right): 7 July, 9 July, 16 July, 21 July, 23 July, 29 July, 30 July, 6 August, 11 August
+```{r}
+# Nitrate
+shm_no3 <- plot_shm(
+  quick_ref = "logNO3",
+  breaks = c(log10(1), log10(3), log10(9), log10(27)),
+  labels = c("0", "2", "8", "26"),
+  title = expression(atop(bold(NO[3]^"-"), bold("\u00B5M")))
+  ); (shm_no3_w_leg <- assemble_panels(shm_no3, w = c(1.1, 4)))
+
+# Nitrite
+shm_no2 <- plot_shm(
+  quick_ref = "logNO2",
+  breaks = c(log10(1), log10(1.1), log10(1.2), log10(1.30)),
+  labels = c("0", "0.1", "0.2", "0.3"),
+  title = expression(atop(bold(NO[2]^"-"), bold("\u00B5M")))
+); (shm_no2_w_leg <- assemble_panels(shm_no2, w = c(1.1, 4)))
+
+# Ammonia
+shm_nh3 <- plot_shm(
+  quick_ref = "logNH3",
+  breaks = c(log10(1), log10(4), log10(16)),
+  labels = c("0", "3", "15"),
+  title = expression(atop(bold(NH[3]), bold("\u00B5M")))
+); (shm_nh3_w_leg <- assemble_panels(shm_nh3, w = c(1.1, 4)))
+
+# Phosphate
+shm_po4 <- plot_shm(
+  quick_ref = "logPO4",
+  breaks = c(log10(1), log10(2), log10(4)),
+  labels = c("0", "1", "3"),
+  title = expression(atop(bold("PO"[4]^{"3-"}), bold("\u00B5M")))
+); (shm_po4_w_leg <- assemble_panels(shm_po4, w = c(1.1, 4)))
+
+# Silica
+shm_sio2 <- plot_shm(
+  quick_ref = "logSiO2",
+  breaks = c(log10(31), log10(91), log10(301)),
+  labels = c("30", "90", "300"),
+  title = expression(atop(bold("SiO"[2]), bold("\u00B5M")))
+); (shm_sio2_w_leg <- assemble_panels(shm_sio2, w = c(1.1, 4)))
+
+# Turbidity
+shm_turb <- plot_shm(
+  quick_ref = "logTurb",
+  breaks =  c(log10(1), log10(5), log10(25)),
+  labels = c("0", "4", "24"),
+  title = expression(atop(bold("Turb."), bold("(FAU)")))
+); (shm_turb_w_leg <- assemble_panels(shm_turb, w = c(1.1, 4)))
+```
+
+## Assemble all maps
+```{r}
+shm_ysi = ggarrange(shm_temp_w_leg,
+                    shm_sal_w_leg,
+                    shm_do_w_leg,
+                    shm_ph_w_leg,
+                    ncol = 1, nrow = 4, align = "hv") # 8 x 5 ysi plots
+
+shm_hach = ggarrange(shm_no3_w_leg,
+                     shm_no2_w_leg,
+                     shm_nh3_w_leg,
+                     shm_po4_w_leg,
+                     shm_sio2_w_leg,
+                     shm_turb_w_leg,
+                     ncol = 1, nrow = 7, align = "hv") # 6 x 5 ysi plots
+
+empty_plot = ggplot() + theme_void() # Create empty plot for white space
+
+(shm_final = ggarrange(
+  shm_ysi, 
+  empty_plot, 
+  ggarrange(
+    shm_hach, 
+    empty_plot, 
+    ncol = 1, 
+    nrow = 2, 
+    heights = c(7,1)),
+  ncol = 3, 
+  nrow = 1, 
+  widths = c(10,0.75,10), 
+  labels = c("A","","B"),
+  font.label = list(size = 24, face = "bold")
+))
+
+# Save to file
+ggsave(
+  file.path(output_path,"figure_3_pchem_maps/pchem_maps_v5.pdf"), 
+  shm_final,
+  width = 12, 
+  height = 10, # Actual size 5 in
+  units = c("in"), 
+  dpi = 300
+  )
+```
+
+# Supplementary ratio spatial heatmaps
+```{r}
+# Cap extreme interpolated values for ratios before plotting
+idw_res_capped <- idw_res %>%
+  mutate(
+    var1.pred = case_when(
+      # Cap TIN:TIP at 50 mol:mol (ecologically reasonable upper limit)
+      quick_ref == "logtintip" & var1.pred > log10(65) ~ log10(65),
+      
+      # Cap TIN:SiO2 at 16 mol:mol (Redfield ratio)
+      quick_ref == "logtinsio2" & var1.pred > log10(17) ~ log10(17),
+      
+      # Cap SiO2:Sal at 30 μM:ppt (reasonable upper limit)
+      quick_ref == "logsio2sal" & var1.pred > log10(31) ~ log10(31),
+      
+      # Keep all other values as-is
+      TRUE ~ var1.pred
+    )
+  )
+```
+
+```{r}
+# ---- Unified plot function with color scheme options ----
+plot_idw_unified <- function(idw_sf_one, breaks, labels = NULL,
+                            color_scheme = "sequential",
+                            midpoint = NULL,
+                            linewidth = 0.5) {
+  
+  stopifnot(inherits(idw_sf_one, "sf"))
+  if (is.null(labels)) labels <- breaks
+  
+  lims <- range(c(idw_sf_one$var1.pred, breaks), na.rm = TRUE)
+  
+  # Extract coordinates from sf geometry
+  xy <- sf::st_coordinates(idw_sf_one)
+  
+  df_grid <- idw_sf_one %>%
+    sf::st_drop_geometry() %>%
+    dplyr::mutate(x = xy[, 1], y = xy[, 2]) %>%
+    dplyr::select(x, y, var1.pred)
+  
+  # Build base plot
+  p <- ggplot() +
+    geom_sf(data = hfp_total_area, fill = NA, color = "black", linewidth = 0.5) +
+    geom_raster(data = df_grid, aes(x = x, y = y, fill = var1.pred), interpolate = TRUE)
+  
+  # Add color scale based on scheme
+  if (color_scheme == "sequential") {
+    # Spectral palette (for main nutrients)
+    p <- p + scale_fill_gradientn(
+      colors = rev(RColorBrewer::brewer.pal(11, "Spectral")),
+      limits = lims,
+      breaks = breaks,
+      labels = labels,
+      na.value = NA
+    )
+  } else if (color_scheme == "diverging") {
+    # Purple-white-green diverging (for ratios with reference point)
+    if (is.null(midpoint)) stop("midpoint required for diverging color scheme")
+    
+    # Use gradientn for full control - position colors manually
+    scale_lims <- c(min(breaks), max(breaks))
+    
+    # Calculate where midpoint falls in the 0-1 range of the scale
+    midpoint_position <- (midpoint - scale_lims[1]) / (scale_lims[2] - scale_lims[1])
+    
+    p <- p + scale_fill_gradientn(
+      colors = c("#9970AB", "white", "#5AAE61"),  # purple, white, green
+      values = c(0, midpoint_position, 1),  # position white exactly at midpoint
+      limits = scale_lims,
+      breaks = breaks,
+      labels = labels,
+      na.value = NA
+    )
+  } else if (color_scheme == "sequential_diverging") {
+    # Purple-white gradient (for uniformly limited ratios)
+    p <- p + scale_fill_gradient(
+      low = "#9970AB",
+      high = "white",
+      limits = lims,
+      breaks = breaks,
+      labels = labels,
+      na.value = NA
+    )
+  }
+  
+  # Add remaining layers
+  p <- p +
+    geom_sf(data = mangrove_island, fill = "grey95", color = "black", linewidth = 0.5) +
+    scale_x_continuous(breaks = long_breaks) +
+    scale_y_continuous(breaks = lat_breaks) +
+    geom_point(data = makaha_coord, aes(x = x, y = y), size = 2, color = "white", shape = 18) +
+    geom_point(data = site_coord, aes(x = x, y = y, shape = Region), size = 1.5, color = "black") +
+    scale_shape_manual(values = c("Kahawai"= 1, "Makai" = 0, "Mauka" = 2), guide = "none") +
+    theme_minimal() +
+    theme(
+      axis.title = element_blank(),
+      axis.text  = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.ticks = element_line(linewidth = 0.5),
+      axis.ticks.length = unit(6, "pt"),
+      plot.margin = margin(0, 0, 0, 0, "cm")
+    )
+  
+  return(p)
+}
+
+# ---- Unified legend function ----
+plot_idw_legend_unified <- function(idw_sf_one, breaks, labels = NULL, 
+                                   title, color_scheme = "sequential",
+                                   midpoint = NULL, barheight = 4.5) {
+  
+  if (is.null(labels)) labels <- breaks
+  
+  p_for_leg <- plot_idw_unified(
+    idw_sf_one = idw_sf_one,
+    breaks = breaks,
+    labels = labels,
+    color_scheme = color_scheme,
+    midpoint = midpoint
+  ) + 
+    guides(fill = guide_colorbar(
+      title = title,
+      title.position = "left",
+      title.hjust = 0.5,
+      label.position = "right",
+      barwidth = 0.5,
+      barheight = barheight,
+      ticks = TRUE,
+      ticks.colour = "black",
+      ticks.linewidth = 0.5,
+      frame.colour = "black",
+      frame.linewidth = 0.5
+    )) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(angle = 90, face = "bold", size = 20),
+      legend.text  = element_text(size = 20),
+      legend.ticks.length = unit(0.5, "mm")
+    )
+  
+  ggpubr::as_ggplot(ggpubr::get_legend(p_for_leg))
+}
+
+# ---- Unified multi-panel function ----
+plot_shm_unified <- function(quick_ref,
+                            breaks,
+                            labels = NULL,
+                            title,
+                            color_scheme = "sequential",
+                            midpoint = NULL,
+                            n_dates = length(d_list)) {
+  
+  df <- idw_res_capped %>% dplyr::filter(quick_ref == !!quick_ref)
+  
+  if (nrow(df) == 0) stop("No IDW results found for quick_ref = ", quick_ref)
+  
+  # Build row of panels
+  row_plots <- vector("list", length = n_dates)
+  
+  for (k in seq_len(n_dates)) {
+    this_date <- d_list[k]
+    one <- df %>% dplyr::filter(d == this_date)
+    
+    if (nrow(one) == 0) {
+      row_plots[[k]] <- ggplot() + theme_void()
+    } else {
+      row_plots[[k]] <- plot_idw_unified(
+        idw_sf_one = one,
+        breaks = breaks,
+        labels = labels,
+        color_scheme = color_scheme,
+        midpoint = midpoint
+      ) + theme(legend.position = "none")
+    }
+  }
+  
+  panels_plot <- ggpubr::ggarrange(plotlist = row_plots, ncol = n_dates, nrow = 1, align = "hv")
+  
+  # Legend
+  legend_df <- df %>% dplyr::filter(d == d_list[1])
+  if (nrow(legend_df) == 0) legend_df <- df[1, , drop = FALSE]
+  
+  legend_plot <- plot_idw_legend_unified(
+    idw_sf_one = legend_df,
+    breaks = breaks,
+    labels = labels,
+    title = title,
+    color_scheme = color_scheme,
+    midpoint = midpoint,
+    barheight = 4.5
+  )
+  
+  list(panels_plot, legend_plot)
+}
+
+# TIN:TIP - diverging scale with symmetric limits
+shm_tintip <- plot_shm_unified(
+  quick_ref = "logtintip",
+  breaks = c(log10(1), log10(5), log10(17), log10(65)),
+  labels = c("0", "4", "16", "64+"),
+  title = expression(bold("TIN:TIP")),
+  color_scheme = "diverging",
+  midpoint = log10(17)
+); (shm_tintip_w_leg <- assemble_panels(shm_tintip, w = c(1.1, 4)))
+
+# TIN:SiO2 - purple to white gradient (white = 1:1 Redfield ratio)
+shm_tinsio2 <- plot_shm_unified(
+  quick_ref = "logtinsio2",
+  breaks = c(log10(1), log10(1.4), log10(2)),
+  labels = c("0", "0.4", "1"),
+  title = expression(bold("TIN:SiO"[2])),
+  color_scheme = "sequential_diverging",  # Purple to white only
+  midpoint = NULL  # Not needed for sequential_diverging
+); (shm_tinsio2_w_leg <- assemble_panels(shm_tinsio2, w = c(1.1, 4)))
+
+# Calculate mid-range for SiO2:Sal (for centering)
+sio2sal_midrange <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  summarize(
+    min_val = min(sil_to_sal_t, na.rm = TRUE),
+    max_val = max(sil_to_sal_t, na.rm = TRUE),
+    midrange = (min_val + max_val) / 2
+  ) %>%
+  pull(midrange)
+
+# SiO2:Sal - diverging scale centered at mean
+shm_sio2sal <- plot_shm_unified(
+  quick_ref = "logsio2sal",
+  breaks = c(log10(1.3), log10(4), log10(11), log10(31)),
+  labels = c("0.3", "3", "10", "30+"),
+  title = expression(bold("SiO"[2]*":Sal")),
+  color_scheme = "diverging",
+  midpoint = sio2sal_midrange
+); (shm_sio2sal_w_leg <- assemble_panels(shm_sio2sal, w = c(1.1, 4)))
+```
+
+
+```{r}
+# Report missing and capped values by variable
+cat("========================================\n")
+cat("MISSING VALUES (NAs)\n")
+cat("========================================\n\n")
+
+# TIN:TIP missing
+missing_tintip <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(is.na(tin_to_tip_t)) %>%
+  mutate(sample_id = paste0(Site, " (", format(Date, "%d %b"), ")")) %>%
+  pull(sample_id)
+
+cat("TIN:TIP missing values:\n")
+if (length(missing_tintip) > 0) {
+  cat(paste(missing_tintip, collapse = ", "), "\n\n")
+} else {
+  cat("None\n\n")
+}
+
+# TIN:SiO2 missing
+missing_tinsio2 <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(is.na(tin_to_sil_t)) %>%
+  mutate(sample_id = paste0(Site, " (", format(Date, "%d %b"), ")")) %>%
+  pull(sample_id)
+
+cat("TIN:SiO2 missing values:\n")
+if (length(missing_tinsio2) > 0) {
+  cat(paste(missing_tinsio2, collapse = ", "), "\n\n")
+} else {
+  cat("None\n\n")
+}
+
+# SiO2:Sal missing
+missing_sio2sal <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(is.na(sil_to_sal_t)) %>%
+  mutate(sample_id = paste0(Site, " (", format(Date, "%d %b"), ")")) %>%
+  pull(sample_id)
+
+cat("SiO2:Sal missing values:\n")
+if (length(missing_sio2sal) > 0) {
+  cat(paste(missing_sio2sal, collapse = ", "), "\n\n")
+} else {
+  cat("None\n\n")
+}
+
+cat("========================================\n")
+cat("CAPPED VALUES (extreme ratios)\n")
+cat("========================================\n\n")
+
+# TIN:TIP capped
+capped_tintip <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(tin_to_tip_t > log10(51)) %>%
+  mutate(
+    sample_id = paste0(Site, " (", format(Date, "%d %b"), ")"),
+    original_value = round(10^tin_to_tip_t - 1, 1)
+  ) %>%
+  select(sample_id, original_value)
+
+cat("TIN:TIP capped at 50:\n")
+if (nrow(capped_tintip) > 0) {
+  for (i in 1:nrow(capped_tintip)) {
+    cat(sprintf("  %s: %.1f\n", capped_tintip$sample_id[i], capped_tintip$original_value[i]))
+  }
+  cat("\n")
+} else {
+  cat("None\n\n")
+}
+
+# TIN:SiO2 capped
+capped_tinsio2 <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(tin_to_sil_t > log10(2)) %>%  # Adjust threshold if needed
+  mutate(
+    sample_id = paste0(Site, " (", format(Date, "%d %b"), ")"),
+    original_value = round(10^tin_to_sil_t - 1, 2)
+  ) %>%
+  select(sample_id, original_value)
+
+cat("TIN:SiO2 capped at 1:\n")
+if (nrow(capped_tinsio2) > 0) {
+  for (i in 1:nrow(capped_tinsio2)) {
+    cat(sprintf("  %s: %.2f\n", capped_tinsio2$sample_id[i], capped_tinsio2$original_value[i]))
+  }
+  cat("\n")
+} else {
+  cat("None\n\n")
+}
+
+# SiO2:Sal capped
+capped_sio2sal <- meta_xy %>%
+  filter(Date %in% as.Date(c("2014-07-09", "2014-07-16", "2014-07-23", 
+                             "2014-07-30", "2014-08-06"))) %>%
+  filter(sil_to_sal_t > log10(31)) %>%
+  mutate(
+    sample_id = paste0(Site, " (", format(Date, "%d %b"), ")"),
+    original_value = round(10^sil_to_sal_t - 1, 1)
+  ) %>%
+  select(sample_id, original_value)
+
+cat("SiO2:Sal capped at 30:\n")
+if (nrow(capped_sio2sal) > 0) {
+  for (i in 1:nrow(capped_sio2sal)) {
+    cat(sprintf("  %s: %.1f\n", capped_sio2sal$sample_id[i], capped_sio2sal$original_value[i]))
+  }
+  cat("\n")
+} else {
+  cat("None\n\n")
+}
+
+# Assemble ratio figure
+(shm_ratios <- ggarrange(shm_tintip_w_leg,
+                        shm_tinsio2_w_leg,
+                        shm_sio2sal_w_leg,
+                        ncol = 1, nrow = 3, align = "hv"))
+
+
+cat("========================================\n")
+cat("CENTERS\n")
+cat("========================================\n\n")
+print(paste("SiO2:Sal center:", round(10^sio2sal_midrange - 1, 1)))
+
+# Save with proportional dimensions
+ggsave(
+  file.path(output_path, "figure_supp2_pchem_ratio_maps/ratio_maps_v1.pdf"), 
+  shm_ratios,
+  width = 6,
+  height = 5,
+  units = "in", 
+  dpi = 300
+)
+```
+
+# Summary of spatial interpolation
+
+**Plain-language summary**
+To visualize how water quality varied across the fishpond, we created interpolated maps for each sampling date. We used inverse distance weighting (IDW), a method that estimates values at unsampled locations by giving more weight to nearby measurements than to distant ones. Interpolation was constrained to the area enclosed by our sampling sites to avoid extrapolating beyond the data. This produced smooth spatial surfaces that reveal gradients and patterns across the fishpond while remaining faithful to the observed measurements.
+
+**Publication-ready summary**
+Continuous spatial surfaces were generated for each physicochemical variable and sampling date using inverse distance weighting (IDW; power = 2). Interpolation was performed on a regular grid and constrained to the convex hull of sampling locations to prevent extrapolation beyond observed data.
